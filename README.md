@@ -7,10 +7,14 @@ Fixes simultaneous audio output from both speakers and headphones on Huawei Mate
 | Field | Value |
 |-------|-------|
 | Laptop | Huawei MateBook D15 |
-| Board | BOD-WXX9-PCB-B4 |
-| Tested OS | Ubuntu 24.04 LTS, kernel 6.17.0-23-generic |
+| Board | BOD-WXX9-PCB-B4 (orig), **BoF-XX / BoF-XX-PCB** (this device) |
+| Tested OS | Ubuntu 24.04 LTS, kernel 6.17.0-23-generic (BOD); rolling kernel 6.18 (BoF-XX) |
 | Audio codec | Everest Semi ES8336 (ACPI: ESSX8336) |
 | Speaker amp | Huawei custom HWSP0001 (no Linux driver) |
+
+The script **auto-detects** the I2C bus and the Headphone-Jack ALSA control, so it
+works on both boards without editing. The only board-specific value is the amp
+enable **GPIO line** (see [GPIO line](#gpio-line)).
 
 May also work on other MateBook models with HWSP0001 — see [Compatibility](#compatibility).
 
@@ -26,8 +30,8 @@ The standard ALSA/DAPM controls, WirePlumber routing, and GPIO tweaks from the `
 
 Through DSDT analysis and I2C register dumping, we identified:
 
-- The speaker amp (`HWSP0001`) sits on **I2C bus 2** at addresses **0x58** (L) and **0x5B** (R), running at 400kHz
-- **GPIO 267** on `gpiochip0` is the amp enable pin
+- The speaker amp (`HWSP0001`) sits on an I2C bus at addresses **0x58** (L) and **0x5B** (R), running at 400kHz. The exact bus differs by board: **i2c-2** on BOD-WXX9, **i2c-4** on BoF-XX. The script auto-detects it from `/sys/bus/i2c/devices/i2c-HWSP0001:00`.
+- The **amp enable GPIO line** is board-specific (e.g. **267** on BOD-WXX9). Verify it for your board — see [GPIO line](#gpio-line).
 - After a GPIO power cycle (`0 → 1`), the amp comes back alive on I2C but in a default (silent) state
 - Writing back the 27 BIOS-initialized register values via `i2cset` fully restores the amp
 
@@ -95,38 +99,72 @@ ls /sys/bus/acpi/devices/ | grep -i hw
 # Should show: HWSP0001:00
 ```
 
-To check if the amp is on I2C bus 2 at the same addresses:
+To check which I2C bus the amp is on (the bus differs by board — i2c-2 on
+BOD-WXX9, i2c-4 on BoF-XX):
 ```bash
 readlink -f /sys/bus/i2c/devices/i2c-HWSP0001:00
-# Should contain: i2c_designware.2/i2c-2
+# BOD-WXX9 -> .../i2c_designware.2/i2c-2/...
+# BoF-XX   -> .../i2c_designware.3/i2c-4/...
+```
+The script auto-detects this, so you normally don't need to set `I2C_BUS`.
+
+### GPIO line
+
+The amp enable GPIO line is **board-specific**. It is set at the top of
+`huawei-speaker-mute.sh` (default `GPIO_LINE=267`, verified on BOD-WXX9).
+
+**For BoF-XX** the line is the same Intel PCH GPIO community, but verify it on
+your board by disassembling the DSDT and reading the `GNUM(...)` argument of the
+HWSP device's `_INI` method:
+
+```bash
+sudo apt install acpica-tools
+sudo iasl -d /sys/firmware/acpi/tables/DSDT
+grep -n -A6 'Device (HWSP)' dsdt.dsl
+# look for:  PIN1 = GNUM (0x090B00XX)
+# GPIO line = GINF(0x09, 6) + 0xXX   (GINF(0x09,6)=256 on these boards)
+#   e.g. 0x090B000B -> 256 + 0x0B = 267
 ```
 
-If your board uses different GPIO or I2C bus numbers, edit the variables at the top of `huawei-speaker-mute.sh`:
+If your board uses a different GPIO line or chip, override the defaults via env
+vars when starting the service, or edit the top of the script:
 
 ```bash
 GPIOCHIP=gpiochip0
-LINE=267          # GPIO line for amp enable
-JACK_NUMID=27     # ALSA control numid for Headphone Jack
-I2C_BUS=2         # I2C bus number
+GPIO_LINE=267      # amp enable GPIO line (verify per board)
+JACK_NUMID=        # left empty -> auto-detected from "Headphone Jack"
+I2C_BUS=           # left empty -> auto-detected from i2c-HWSP0001:00
 ```
 
-**If your register values differ:** the I2C register values in the script are specific to BOD-WXX9. If your amp has a different initialization state, you'll need to dump your own registers right after a fresh boot (before plugging in headphones):
+**About the register values:** the values in `reinit_amp()` are the HWSP0001
+**enable** values (same silicon across BOD-WXX9 / BoF-XX). Important for BoF-XX:
+a fresh-boot `i2cdump` on i2c-4 shows the amp's **default *silent* state**, which
+matches BOD-WXX9's documented silent-default values — this means BoF-XX's BIOS
+does **not** initialize the amp at boot. So you must **NOT** copy a fresh-boot
+dump into the script; the script's existing enable values are what actually
+produce sound. Only revisit these values if you have a known-good "sound works"
+dump from a different board revision.
+
+If you want to inspect the current state, dump on the correct bus:
 
 ```bash
-sudo i2cdump -y -f 2 0x58 > amp_0x58_init.txt
-sudo i2cdump -y -f 2 0x5B > amp_0x5B_init.txt
+# BOD-WXX9:
+sudo i2cdump -y -f 2 0x58
+sudo i2cdump -y -f 2 0x5B
+# BoF-XX (amp is on i2c-4! -- a silent-default dump is expected):
+sudo i2cdump -y -f 4 0x58
+sudo i2cdump -y -f 4 0x5B
 ```
-
-Then update the `reinit_amp()` function accordingly. Feel free to open an issue with your dump and board info.
 
 ## Technical Details
 
 ### DSDT Analysis
 
-The HWSP0001 device in ACPI (`\_SB_.PC00.I2C3.HWSP`):
-- Two I2C resources: 0x58 and 0x5B at 400kHz on I2C3
-- GPIO enable pin decoded via `GNUM(0x090B000B)` → gpio-267
-- `_INI` method only sets the GPIO pin number in the resource template — it does **not** initialize the amp over I2C
+The HWSP0001 device in ACPI:
+- **BOD-WXX9**: `\_SB_.PC00.I2C3.HWSP` — two I2C resources 0x58/0x5B at 400kHz on I2C3; GPIO enable pin via `GNUM(0x090B000B)` → gpio-267
+- **BoF-XX**: `\_SB_.PC00.I2C5.HWSP` — same 0x58/0x5B at 400kHz, but on I2C5 (i2c-4); GPIO community is the same Intel PCH, verify the exact line with the method in [GPIO line](#gpio-line)
+
+`_INI` only sets the GPIO pin number in the resource template — it does **not** initialize the amp over I2C
 
 The actual I2C initialization happens in BIOS firmware (SMM) before Linux boots. There is no ACPI method that triggers it.
 

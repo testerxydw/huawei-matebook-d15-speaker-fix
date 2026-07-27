@@ -1,5 +1,5 @@
 [Unit]
-Description=Huawei MateBook BOD-WXX9 speaker amp jack-aware mute
+Description=Huawei MateBook (BOD-WXX9 / BoF-XX) HWSP0001 speaker amp jack-aware mute
 After=sound.target
 Wants=sound.target
 
