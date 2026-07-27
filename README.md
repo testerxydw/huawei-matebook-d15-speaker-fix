@@ -12,9 +12,10 @@ Fixes simultaneous audio output from both speakers and headphones on Huawei Mate
 | Audio codec | Everest Semi ES8336 (ACPI: ESSX8336) |
 | Speaker amp | Huawei custom HWSP0001 (no Linux driver) |
 
-The script **auto-detects** the I2C bus and the Headphone-Jack ALSA control, so it
-works on both boards without editing. The only board-specific value is the amp
-enable **GPIO line** (see [GPIO line](#gpio-line)).
+The script **auto-detects every board-specific parameter at runtime** — the I2C
+bus, the Headphone-Jack ALSA control, the speaker volume control, and even the
+amp-enable **GPIO line** (decoded from the DSDT via `iasl`, see
+[GPIO line](#gpio-line)). No manual editing is required for either board.
 
 May also work on other MateBook models with HWSP0001 — see [Compatibility](#compatibility).
 
@@ -31,14 +32,15 @@ The standard ALSA/DAPM controls, WirePlumber routing, and GPIO tweaks from the `
 Through DSDT analysis and I2C register dumping, we identified:
 
 - The speaker amp (`HWSP0001`) sits on an I2C bus at addresses **0x58** (L) and **0x5B** (R), running at 400kHz. The exact bus differs by board: **i2c-2** on BOD-WXX9, **i2c-4** on BoF-XX. The script auto-detects it from `/sys/bus/i2c/devices/i2c-HWSP0001:00`.
-- The **amp enable GPIO line** is board-specific (e.g. **267** on BOD-WXX9). Verify it for your board — see [GPIO line](#gpio-line).
+- The **amp enable GPIO line** is board-specific (e.g. **267** on BOD-WXX9, **145** on BoF-XX) but is **auto-detected** from the DSDT — see [GPIO line](#gpio-line).
 - After a GPIO power cycle (`0 → 1`), the amp comes back alive on I2C but in a default (silent) state
 - Writing back the 27 BIOS-initialized register values via `i2cset` fully restores the amp
 
 The fix is a `systemd` service that:
 1. Monitors the ALSA Headphone Jack control via `alsactl monitor`
-2. Sets GPIO 267 low when headphones are inserted (amp off)
-3. Sets GPIO 267 high when headphones are removed (amp on), then replays the I2C register initialization
+2. Drives the amp-enable GPIO **low** when headphones are inserted (amp off)
+3. Drives the GPIO **high** when headphones are removed (amp on), then replays the I2C register initialization
+4. On a real unplug event, drives PipeWire (`wpctl`) to **force the speaker volume to 0** before re-powering the amp (avoids a blast); boot / plug-in leave the volume untouched
 
 ```
 Jack event detected
@@ -53,6 +55,18 @@ Jack event detected
                     ▼
            Speakers working ✓
 ```
+
+## Headphone-unplug Safety (auto volume = 0)
+
+On this hardware a single PipeWire sink drives both the headphone and the
+speaker, and **PipeWire owns the volume** — writing the ALSA mixer alone is
+immediately overridden by PipeWire. So when you **unplug the headphones**, the
+script drives `wpctl` (as your desktop user) to **force the speaker volume to 0**
+*before* the amp is re-powered, so it never blasts at the previous headphone
+volume; you then raise it manually with your volume keys / mixer.
+
+Boot and headphone plug-in leave the volume **untouched** (your headphone volume
+is never clobbered). The volume is only changed on a genuine jack transition.
 
 ## Requirements
 
@@ -110,30 +124,34 @@ The script auto-detects this, so you normally don't need to set `I2C_BUS`.
 
 ### GPIO line
 
-The amp enable GPIO line is **board-specific**. It is set at the top of
-`huawei-speaker-mute.sh` (default `GPIO_LINE=267`, verified on BOD-WXX9).
+The amp enable GPIO line is **board-specific**, but the script now
+**auto-detects it** at startup: it disassembles the DSDT with `iasl` and decodes
+the `GNUM(...)` argument of the HWSP device's `_INI` method
+(`line = GPCL[group][6] + (arg & 0xFFFF)`). Verified values:
+**267** on BOD-WXX9, **145** on BoF-XX. If `iasl` is missing or the decode fails,
+it falls back to `GPIO_LINE=145`.
 
-**For BoF-XX** the line is the same Intel PCH GPIO community, but verify it on
-your board by disassembling the DSDT and reading the `GNUM(...)` argument of the
-HWSP device's `_INI` method:
+To verify on your own board:
 
 ```bash
 sudo apt install acpica-tools
 sudo iasl -d /sys/firmware/acpi/tables/DSDT
 grep -n -A6 'Device (HWSP)' dsdt.dsl
-# look for:  PIN1 = GNUM (0x090B00XX)
-# GPIO line = GINF(0x09, 6) + 0xXX   (GINF(0x09,6)=256 on these boards)
-#   e.g. 0x090B000B -> 256 + 0x0B = 267
+# look for:  PIN1 = GNUM (0x090B00XX)   (BOD)   or   GNUM (0x090800XX) (BoF)
+# GPIO line = GPCL[group][6] + 0xXX
+#   BOD: 0x090B000B -> GPCL[0x0B][6]=256 + 0x0B = 267
+#   BoF: 0x09080001 -> GPCL[0x08][6]=144 + 0x01 = 145
 ```
 
-If your board uses a different GPIO line or chip, override the defaults via env
-vars when starting the service, or edit the top of the script:
+All parameters can still be overridden via environment variables (rarely needed):
 
 ```bash
 GPIOCHIP=gpiochip0
-GPIO_LINE=267      # amp enable GPIO line (verify per board)
-JACK_NUMID=        # left empty -> auto-detected from "Headphone Jack"
-I2C_BUS=           # left empty -> auto-detected from i2c-HWSP0001:00
+GPIO_LINE=         # empty -> auto-detected from DSDT (fallback 145)
+JACK_NUMID=        # empty -> auto-detected from "Headphone Jack"
+I2C_BUS=           # empty -> auto-detected from i2c-HWSP0001:00
+SPK_VOL_NUMID=     # empty -> auto-detected (DAC/Speaker/Master Playback Volume)
+SPK_VOL_DEFAULT=70 # % applied on boot / headphone plug-in
 ```
 
 **About the register values:** the values in `reinit_amp()` are the HWSP0001
