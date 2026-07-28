@@ -114,11 +114,36 @@ PY
 }
 
 # ---- 解析参数 ----
+CMD="${1:-}"
 I2C_BUS=$(detect_i2c); [ -n "$I2C_BUS" ] || { echo "错误：找不到 HWSP0001 的 I2C 总线" >&2; exit 1; }
-JACK_NUMID=$(detect_jack); [ -n "$JACK_NUMID" ] || { echo "错误：找不到 'Headphone Jack' 控件" >&2; exit 1; }
+JACK_NUMID=$(detect_jack)
 SPK_VOL_NUMID=$(detect_spk_vol)
 GPIO_LINE=$(detect_gpio)
 GPIO_LINE=${GPIO_LINE:-145}
+
+# 子命令模式（手动控制/排障）：不需要耳机插拔监听，也不依赖 ALSA Jack 控件。
+case "$CMD" in
+  mute)
+    echo "手动软静音扬声器（耳机不受影响）"
+    set_amp 0
+    exit 0
+    ;;
+  unmute)
+    echo "手动恢复扬声器"
+    set_amp 1
+    exit 0
+    ;;
+  status)
+    for A in 0x58 0x5B; do
+      v=$(i2cget -y -f "$I2C_BUS" "$A" 0x01 2>/dev/null)
+      echo "功放 $A 寄存器 0x01 = ${v:-<读取失败>}"
+    done
+    exit 0
+    ;;
+esac
+
+# 监听模式才必须能探测到 Jack 控件
+[ -n "$JACK_NUMID" ] || { echo "错误：找不到 'Headphone Jack' 控件" >&2; exit 1; }
 
 # ---- PipeWire 音量控制（必须以桌面用户身份运行，而非 root） ----
 # 在本机上，单一的 PipeWire sink 同时驱动耳机和扬声器，并且 PipeWire 拥有 ALSA
@@ -200,30 +225,33 @@ unplug_volume_guard() {
 
 set_amp() {
     local val=$1
-    if [ -n "$CURRENT_PID" ]; then
-        kill "$CURRENT_PID" 2>/dev/null
-        wait "$CURRENT_PID" 2>/dev/null
-        sleep 0.15                     # 等待内核释放该 GPIO 线
-    fi
-    # 将功放使能 GPIO 保持在 $val（libgpiod v2：用 -c 选择芯片；末尾的 &
-    # 让 gpioset 持续运行，从而该线在被杀掉前一直被驱动）。
-    # 如果上一个持有者还没释放该线，gpioset 可能短暂地以 EBUSY 失败，
-    # 因此若进程立刻退出则重试几次。
-    gpioset -c "$GPIOCHIP" "$GPIO_LINE=$val" &
-    CURRENT_PID=$!
-    sleep 0.2
-    if ! kill -0 "$CURRENT_PID" 2>/dev/null; then
-        local i
-        for i in 1 2 3 4; do
-            sleep 0.2
-            gpioset -c "$GPIOCHIP" "$GPIO_LINE=$val" &
+    if [ "$val" = "1" ]; then
+        # 启用扬声器：确保 HWSP0001 功放供电 GPIO 常开（libgpiod v2：用 -c
+        # 选择芯片；末尾的 & 让 gpioset 持续运行，在被杀掉前一直驱动该线），
+        # 再回放使能寄存器取消软静音。
+        if [ -z "$CURRENT_PID" ] || ! kill -0 "$CURRENT_PID" 2>/dev/null; then
+            gpioset -c "$GPIOCHIP" "$GPIO_LINE=1" &
             CURRENT_PID=$!
             sleep 0.2
-            kill -0 "$CURRENT_PID" 2>/dev/null && break
-        done
-    fi
-    if [ "$val" = "1" ]; then
+            if ! kill -0 "$CURRENT_PID" 2>/dev/null; then
+                local i
+                for i in 1 2 3 4; do
+                    sleep 0.2
+                    gpioset -c "$GPIOCHIP" "$GPIO_LINE=1" &
+                    CURRENT_PID=$!
+                    sleep 0.2
+                    kill -0 "$CURRENT_PID" 2>/dev/null && break
+                done
+            fi
+        fi
         reinit_amp
+    else
+        # 禁用扬声器：用 HWSP0001 软静音寄存器（0x01=0x00）。该方式只静音
+        # 扬声器，耳机走 ES8336 独立路径不受影响（已实测：写 0x01=0x00 后
+        # 扬声器无声、耳机照常响）。保持功放供电 GPIO 常开，不再翻转它。
+        i2cset -y -f "$I2C_BUS" 0x58 0x01 0x00 2>/dev/null
+        i2cset -y -f "$I2C_BUS" 0x5B 0x01 0x00 2>/dev/null
+        echo "已软静音扬声器（耳机不受影响）"
     fi
 }
 

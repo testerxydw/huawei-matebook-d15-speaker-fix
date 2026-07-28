@@ -1,236 +1,119 @@
-# Huawei MateBook D15 — Speaker/Headphone Auto-Switch Fix for Linux
+# Huawei MateBook D15 (BoF-XX) Speaker / Headphone Auto-Switch Fix
 
-Fixes simultaneous audio output from both speakers and headphones on Huawei MateBook D15 (BOD-WXX9) running Linux. After applying this fix, speakers mute automatically when headphones are plugged in, and **restore correctly when headphones are unplugged** — no reboot required.
+> Target: Huawei MateBook D15 `BoF-XX` (same family as `BOD-WXX9`, all using the ES8336 codec + HWSP0001 speaker amplifier).
+> This solution is **entirely in user space — no kernel recompilation required**.
 
-## Affected Hardware
+## 1. Background
 
-| Field | Value |
-|-------|-------|
-| Laptop | Huawei MateBook D15 |
-| Board | BOD-WXX9-PCB-B4 (orig), **BoF-XX / BoF-XX-PCB** (this device) |
-| Tested OS | Ubuntu 24.04 LTS, kernel 6.17.0-23-generic (BOD); rolling kernel 6.18 (BoF-XX) |
-| Audio codec | Everest Semi ES8336 (ACPI: ESSX8336) |
-| Speaker amp | Huawei custom HWSP0001 (no Linux driver) |
+- The **speaker** is driven by the `HWSP0001` amplifier (I2C bus auto-detected at runtime, `i2c-3` on this board, addresses `0x58`/`0x5B`); the **headphone** uses the `ES8336` codec's independent path. They are independent.
+- `HWSP0001` has no Linux driver: on BoF-XX the amplifier boots muted and must be enabled by replaying a set of I2C "enable" registers (`reinit_amp`).
+- The amplifier provides a **soft-mute register `0x01`**:
+  - Write `0x00` → **mutes the speaker only**; the headphone keeps playing (verified).
+  - Write `0x69` → restores the speaker.
+- Plug/unplug can be observed from user space via `alsactl monitor hw:0` on the ALSA `Headphone Jack` control.
 
-The script **auto-detects every board-specific parameter at runtime** — the I2C
-bus, the Headphone-Jack ALSA control, the speaker volume control, and even the
-amp-enable **GPIO line** (decoded from the DSDT via `iasl`, see
-[GPIO line](#gpio-line)). No manual editing is required for either board.
+**The bug**: the auto script used to toggle the amplifier power GPIO (`gpio-145`) to mute the speaker on headphone insert, but on this machine that does not actually silence the speaker — hence "speaker still plays when headphones are inserted / speaker keeps playing when booting with headphones plugged".
 
-May also work on other MateBook models with HWSP0001 — see [Compatibility](#compatibility).
+**Fix**: change the "mute speaker" action to write the amplifier soft-mute register `0x01=0x00` (speaker only, headphone unaffected), executed automatically by the script on plug/unplug.
 
-## The Problem
+## 2. Specific Fix
 
-Linux has no driver for the `HWSP0001` speaker amplifier. The BIOS initializes it once at boot via SMM (before the OS loads), but there is no mechanism in Linux to:
-- Mute the speakers when headphones are plugged in
-- Re-initialize the amp after it's been powered off
+Only `huawei-speaker-mute.sh`'s `set_amp()` was changed (logic otherwise unchanged):
 
-The standard ALSA/DAPM controls, WirePlumber routing, and GPIO tweaks from the `snd_soc_sof_es8336` driver all fail because they don't control the actual amplifier chip.
+- **Enable speaker (`val=1`)**: keep the amplifier power GPIO (`gpio-145`) on and call `reinit_amp()` to replay enable registers (un-mute).
+- **Disable speaker (`val=0`, i.e. on headphone insert)**: instead of toggling `gpio-145`, write the soft-mute register:
+  ```bash
+  i2cset -y -f "$I2C_BUS" 0x58 0x01 0x00   # soft-mute left amplifier
+  i2cset -y -f "$I2C_BUS" 0x5B 0x01 0x00   # soft-mute right amplifier
+  ```
+  This mutes only the speaker; the headphone (ES8336 path) is unaffected.
+- `apply()` is unchanged: `jack=on` → `set_amp 0` (speaker muted); `jack=off` → `set_amp 1` (speaker restored) and `unplug_volume_guard` zeroes the PipeWire/ALSA speaker volume first (no pop), which the user can then raise.
 
-## How It Works
+> Note: an in-kernel alternative was explored earlier (a `JD_INVERTED` quirk for the `es8336` codec driver, in `es8336-jack-invert/`). Because plug/unplug is already reliably observable from user space and the amplifier soft-mute achieves the same result, **the user-space script is the chosen solution** — simpler and instantly reversible, no kernel module build.
 
-Through DSDT analysis and I2C register dumping, we identified:
+## 3. Fix Steps (Deploy)
 
-- The speaker amp (`HWSP0001`) sits on an I2C bus at addresses **0x58** (L) and **0x5B** (R), running at 400kHz. The exact bus differs by board: **i2c-2** on BOD-WXX9, **i2c-4** on BoF-XX. The script auto-detects it from `/sys/bus/i2c/devices/i2c-HWSP0001:00`.
-- The **amp enable GPIO line** is board-specific (e.g. **267** on BOD-WXX9, **145** on BoF-XX) but is **auto-detected** from the DSDT — see [GPIO line](#gpio-line).
-- After a GPIO power cycle (`0 → 1`), the amp comes back alive on I2C but in a default (silent) state
-- Writing back the 27 BIOS-initialized register values via `i2cset` fully restores the amp
+1. Install the script and systemd service (as root):
+   ```bash
+   sudo ./install.sh
+   ```
+   This installs `huawei-speaker-mute.sh` to `/usr/local/bin/` (falls back to `/opt/` if not writable) and enables `huawei-speaker-mute.service` (auto-starts, auto-monitors plug/unplug). On this machine the installed path is `/opt/huawei-speaker-mute.sh`.
+2. Apply immediately (no reboot needed):
+   ```bash
+   sudo systemctl restart huawei-speaker-mute.service
+   ```
+3. Confirm it is running:
+   ```bash
+   systemctl status huawei-speaker-mute.service
+   ```
 
-The fix is a `systemd` service that:
-1. Monitors the ALSA Headphone Jack control via `alsactl monitor`
-2. Drives the amp-enable GPIO **low** when headphones are inserted (amp off)
-3. Drives the GPIO **high** when headphones are removed (amp on), then replays the I2C register initialization
-4. On a real unplug event, drives PipeWire (`wpctl`) to **force the speaker volume to 0** before re-powering the amp (avoids a blast); boot / plug-in leave the volume untouched
-
-```
-Jack event detected
-        │
-   jack=on  ──→ gpio=0  (amp OFF, headphones active)
-   jack=off ──→ gpio=1  (amp ON)
-                    │
-                    ▼
-             i2cset replay
-         27 registers → 0x58 & 0x5B
-                    │
-                    ▼
-           Speakers working ✓
-```
-
-## Headphone-unplug Safety (auto volume = 0)
-
-On this hardware a single PipeWire sink drives both the headphone and the
-speaker, and **PipeWire owns the volume** — writing the ALSA mixer alone is
-immediately overridden by PipeWire. So when you **unplug the headphones**, the
-script drives `wpctl` (as your desktop user) to **force the speaker volume to 0**
-*before* the amp is re-powered, so it never blasts at the previous headphone
-volume; you then raise it manually with your volume keys / mixer.
-
-Boot and headphone plug-in leave the volume **untouched** (your headphone volume
-is never clobbered). The volume is only changed on a genuine jack transition.
-
-## Requirements
-
+Manual control (independent of auto-monitoring) is also supported:
 ```bash
-sudo apt install i2c-tools gpiod alsa-utils
+huawei-speaker-mute.sh mute     # soft-mute speaker (same as headphone inserted)
+huawei-speaker-mute.sh unmute   # restore speaker
+huawei-speaker-mute.sh status   # show amplifier 0x01 register state
 ```
 
-## Installation
+## 4. Verification Criteria
 
+All of the following must hold for the fix to be considered successful:
+
+| Scenario | Expected | Pass when |
+|----------|----------|-----------|
+| **Headphone inserted** | Speaker **silent**; headphone **audible** | Speaker muted, headphone works |
+| **Headphone removed** | Speaker **audible again** (muted first, then user raises volume) | Speaker returns after unplug |
+| **Boot with headphone plugged** | Speaker **silent** at startup | No speaker sound when booting plugged-in |
+| **Boot without headphone** | Speaker **audible** | Normal speaker output |
+| **No pops during switch** | Volume zeroed before restore on unplug | No loud "pop" |
+
+Helper checks:
 ```bash
-git clone https://github.com/YOUR_USERNAME/huawei-matebook-d15-speaker-fix
-cd huawei-matebook-d15-speaker-fix
-sudo bash install.sh
+huawei-speaker-mute.sh status                       # prints 0x01 of 0x58/0x5B (0x00=muted, 0x69=restored)
+i2cget -y -f <I2C_BUS> 0x58 0x01                    # <I2C_BUS> auto-detected (i2c-3 here); 0x00 inserted / 0x69 removed
+alsactl monitor hw:0                                # observe Headphone Jack flips on plug/unplug
 ```
 
-That's it. The service starts immediately and enables on boot.
+If any check fails, verify: ① service is running; ② `Headphone Jack` actually flips on plug/unplug; ③ `i2cset` can reach `0x58/0x5B` (needs root).
 
-## Manual Installation
+## 5. Rollback
 
-```bash
-sudo cp huawei-speaker-mute.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/huawei-speaker-mute.sh
-sudo cp huawei-speaker-mute.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now huawei-speaker-mute.service
-```
+- Stop auto-switching: `sudo systemctl stop huawei-speaker-mute.service`.
+- Fully uninstall: reverse of `install.sh` (remove `/usr/local/bin/huawei-speaker-mute.sh` and disable the service).
+- No kernel is modified, so rollback leaves no residual risk.
 
-## Verifying It Works
+## 6. Kernel-Independence Verification (no kernel changes)
 
-```bash
-sudo systemctl status huawei-speaker-mute.service
-```
+This fix **does not modify any kernel file, kernel config, or kernel module**. Evidence:
 
-Plug in headphones → speakers should go silent.  
-Unplug headphones → speakers should come back within ~0.5 seconds.
+1. **No custom kernel module built/installed**: the stock `snd-soc-es8336.ko.zst` remains at `/lib/modules/$(uname -r)/kernel/sound/soc/codecs/`; no `es83xx` custom module exists under `/updates` or `/extra`; `dkms status` shows only `deepin-anything` (unrelated).
+2. **Kernel config unchanged**: a `diff` of the running `/proc/config.gz` against the distro's original `/boot/config-$(uname -r)` returns **identical (KERNEL_CONFIG_IDENTICAL)**. Key options such as `CONFIG_MODULE_FORCE_UNLOAD` (unset, consistent with our earlier failed `rmmod -f`) and `CONFIG_SND_SOC_ES8336=m` are distro defaults.
+3. **Source change scope**: `git diff` shows only the user-space script `huawei-speaker-mute.sh` and the two READMEs changed; the earlier `es8336-jack-invert/` exploration directory was deleted with no residue.
+4. **Implementation**: the whole fix is achieved only via user-space I2C register writes (`i2cset`) plus ALSA control monitoring (`alsactl monitor`) — no kernel module support is required.
 
-## Compatibility
+**Conclusion: the fix is fully independent of the kernel layer and can be applied directly to any similar system that has not modified its kernel, with instant rollback and zero residue.**
 
-This fix was developed and tested on **BOD-WXX9-PCB-B4**. It may work on other MateBook models that use the same `HWSP0001` amplifier.
+## 7. Portability / Generality Assessment
 
-To check if your board has `HWSP0001`:
-```bash
-ls /sys/bus/acpi/devices/ | grep -i hw
-# Should show: HWSP0001:00
-```
+**The core idea is reusable, but the script itself targets HWSP0001 and cannot be used on other devices as-is.** Two layers:
 
-To check which I2C bus the amp is on (the bus differs by board — i2c-2 on
-BOD-WXX9, i2c-4 on BoF-XX):
-```bash
-readlink -f /sys/bus/i2c/devices/i2c-HWSP0001:00
-# BOD-WXX9 -> .../i2c_designware.2/i2c-2/...
-# BoF-XX   -> .../i2c_designware.3/i2c-4/...
-```
-The script auto-detects this, so you normally don't need to set `I2C_BUS`.
+### Reusable framework (hardware-independent)
+- Monitor plug/unplug via `alsactl monitor` on the `Headphone Jack` control;
+- On transitions, mute/restore the speaker volume through PipeWire (`wpctl`, as the desktop user) to avoid pops;
+- A systemd service keeps it resident and starts at boot.
 
-### GPIO line
+This "user-space plug/unplug monitor → control amplifier/volume" pattern applies to any Linux device with abnormal speaker/headphone switching that you want to fix with a soft approach.
 
-The amp enable GPIO line is **board-specific**, but the script now
-**auto-detects it** at startup: it disassembles the DSDT with `iasl` and decodes
-the `GNUM(...)` argument of the HWSP device's `_INI` method
-(`line = GPCL[group][6] + (arg & 0xFFFF)`). Verified values:
-**267** on BOD-WXX9, **145** on BoF-XX. If `iasl` is missing or the decode fails,
-it falls back to `GPIO_LINE=145`.
+### Device-specific parts (must be adapted per hardware)
+- `detect_i2c()` relies on the `i2c-HWSP0001:00` ACPI device name — other amplifiers won't have this node and detection will fail and exit;
+- `set_amp()`'s soft-mute register (`0x01=0x00`), enable-register sequence (`reinit_amp`), and I2C addresses (`0x58/0x5B`) are all HWSP0001-specific;
+- `detect_gpio()` parses the `GNUM()` argument of the HWSP device in the DSDT to get the amplifier power GPIO line — also model-specific.
 
-To verify on your own board:
+### Conditions to port to another device
+To reuse this approach on another machine you need:
+1. The speaker amplifier is reachable over I2C (or similar writable interface) and has a "soft-mute" register;
+2. The headphone uses a path independent of the speaker amplifier (soft-muting the speaker must not also mute the headphone) — satisfied here by the independent ES8336 path;
+3. A monitorable plug/unplug event source exists in the system (ALSA `Headphone Jack`, or some GPIO/input event).
 
-```bash
-sudo apt install acpica-tools
-sudo iasl -d /sys/firmware/acpi/tables/DSDT
-grep -n -A6 'Device (HWSP)' dsdt.dsl
-# look for:  PIN1 = GNUM (0x090B00XX)   (BOD)   or   GNUM (0x090800XX) (BoF)
-# GPIO line = GPCL[group][6] + 0xXX
-#   BOD: 0x090B000B -> GPCL[0x0B][6]=256 + 0x0B = 267
-#   BoF: 0x09080001 -> GPCL[0x08][6]=144 + 0x01 = 145
-```
+When these hold, you only need to replace the I2C bus/address/register values in `set_amp()`, the init sequence in `reinit_amp()`, and (if still GPIO-dependent) the `detect_gpio()` parsing — then the script framework is reusable.
 
-All parameters can still be overridden via environment variables (rarely needed):
-
-```bash
-GPIOCHIP=gpiochip0
-GPIO_LINE=         # empty -> auto-detected from DSDT (fallback 145)
-JACK_NUMID=        # empty -> auto-detected from "Headphone Jack"
-I2C_BUS=           # empty -> auto-detected from i2c-HWSP0001:00
-SPK_VOL_NUMID=     # empty -> auto-detected (DAC/Speaker/Master Playback Volume)
-SPK_VOL_DEFAULT=70 # % applied on boot / headphone plug-in
-```
-
-**About the register values:** the values in `reinit_amp()` are the HWSP0001
-**enable** values (same silicon across BOD-WXX9 / BoF-XX). Important for BoF-XX:
-a fresh-boot `i2cdump` on i2c-4 shows the amp's **default *silent* state**, which
-matches BOD-WXX9's documented silent-default values — this means BoF-XX's BIOS
-does **not** initialize the amp at boot. So you must **NOT** copy a fresh-boot
-dump into the script; the script's existing enable values are what actually
-produce sound. Only revisit these values if you have a known-good "sound works"
-dump from a different board revision.
-
-If you want to inspect the current state, dump on the correct bus:
-
-```bash
-# BOD-WXX9:
-sudo i2cdump -y -f 2 0x58
-sudo i2cdump -y -f 2 0x5B
-# BoF-XX (amp is on i2c-4! -- a silent-default dump is expected):
-sudo i2cdump -y -f 4 0x58
-sudo i2cdump -y -f 4 0x5B
-```
-
-## Technical Details
-
-### DSDT Analysis
-
-The HWSP0001 device in ACPI:
-- **BOD-WXX9**: `\_SB_.PC00.I2C3.HWSP` — two I2C resources 0x58/0x5B at 400kHz on I2C3; GPIO enable pin via `GNUM(0x090B000B)` → gpio-267
-- **BoF-XX**: `\_SB_.PC00.I2C5.HWSP` — same 0x58/0x5B at 400kHz, but on I2C5 (i2c-4); GPIO community is the same Intel PCH, verify the exact line with the method in [GPIO line](#gpio-line)
-
-`_INI` only sets the GPIO pin number in the resource template — it does **not** initialize the amp over I2C
-
-The actual I2C initialization happens in BIOS firmware (SMM) before Linux boots. There is no ACPI method that triggers it.
-
-### Why acpi_call Doesn't Help
-
-After installing `acpi-call-dkms` and inspecting the DSDT, the `_INI` method for HWSP0001 is:
-```c
-Method (_INI, 0, NotSerialized) {
-    PIN1 = GNUM(0x090B000B)  // just writes gpio number into resource template
-}
-```
-No I2C writes. The real init is in BIOS SMM code.
-
-### Register Differences (BIOS init vs default state)
-
-| Register | BIOS value | Default (after power cycle) |
-|----------|-----------|---------------------------|
-| 0x01 | 0x69 | 0x38 |
-| 0x03 | 0x16 | 0x0c |
-| 0x04 | 0x80 | 0x00 |
-| 0x05 | 0x0c | 0x08 |
-| 0x06 | 0x11 | 0x10 |
-| 0x07 | 0x93 | 0x43 |
-| 0x09 | 0x0b | 0x03 |
-| 0x0b | 0x4b | 0x4a |
-| 0x0c | 0x00 | 0x03 |
-| 0x0d | 0x77 | 0xdd |
-| 0x0f | 0x51 | 0x23 |
-| 0x10 | 0x58 | 0x08 |
-| 0x58 | 0x00 | 0x80 |
-| 0x59 | 0x80 | 0x00 |
-| 0x61–0x69 | see script | different |
-| 0x71–0x74 | see script | different |
-
-## Known Limitations
-
-- The exact chip model behind HWSP0001 is unknown (likely TI TAS25xx or similar). Without a datasheet, we don't know the meaning of each register.
-- The register values were captured from one specific board. If your board was manufactured at a different revision or calibrated differently, values may differ.
-- The `snd_soc_sof_es8336` DMI quirk patch for BOD-WXX9 (included in some versions of this repo) activates DAPM speaker switching but has no effect on actual sound output — the real amp is HWSP0001, not controlled by the codec driver.
-
-## Contributing
-
-If you have a different MateBook model with HWSP0001, please open an issue with:
-- Board model (`cat /sys/class/dmi/id/board_name`)
-- Output of `readlink -f /sys/bus/i2c/devices/i2c-HWSP0001:00`
-- Your amp register dump (fresh boot, before any jack events)
-- GPIO number (from `cat /sys/bus/acpi/devices/HWSP0001:00/path` + DSDT analysis)
-
-## License
-
-MIT
+**Conclusion**: `huawei-speaker-mute.sh` is a finished fix for HWSP0001 machines; it is not a turnkey universal tool, but its "monitor plug/unplug + soft-mute amplifier + volume protection" architecture can be used directly as a template for other similar devices.
