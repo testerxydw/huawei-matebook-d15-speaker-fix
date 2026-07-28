@@ -41,6 +41,7 @@
    sudo ./install.sh
    ```
    该脚本会把 `huawei-speaker-mute.sh` 安装到 `/usr/local/bin/`（若不可写则回退到 `/opt/`），并启用 `huawei-speaker-mute.service`（开机自启、自动监听插拔）。本机当前安装路径为 `/opt/huawei-speaker-mute.sh`。
+   安装程序会**先自动检测并安装运行依赖**：`i2c-tools`（`i2cset`/`i2cget`）、`alsa-utils`（`amixer`/`alsactl`）、`libgpiod`/`gpiod`（`gpioset`）、`python3`、`acpica-tools`（`iasl`）。`wpctl`/PipeWire 为可选项，缺失时仅跳过拔耳机音量保护，不影响核心静音功能。
 2. 立即生效（无需重启）：
    ```bash
    sudo systemctl restart huawei-speaker-mute.service

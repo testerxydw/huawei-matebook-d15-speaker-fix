@@ -39,6 +39,7 @@ Only `huawei-speaker-mute.sh`'s `set_amp()` was changed (logic otherwise unchang
    sudo ./install.sh
    ```
    This installs `huawei-speaker-mute.sh` to `/usr/local/bin/` (falls back to `/opt/` if not writable) and enables `huawei-speaker-mute.service` (auto-starts, auto-monitors plug/unplug). On this machine the installed path is `/opt/huawei-speaker-mute.sh`.
+   The installer **auto-detects and installs runtime dependencies first**: `i2c-tools` (`i2cset`/`i2cget`), `alsa-utils` (`amixer`/`alsactl`), `libgpiod`/`gpiod` (`gpioset`), `python3`, `acpica-tools` (`iasl`). `wpctl`/PipeWire is optional — if missing, only the unplug volume guard is skipped; the core mute function is unaffected.
 2. Apply immediately (no reboot needed):
    ```bash
    sudo systemctl restart huawei-speaker-mute.service
