@@ -2,6 +2,7 @@
 
 > 适用机型：华为 MateBook D15 `BoF-XX`（同架构还有 `BOD-WXX9` 等，均使用 ES8336 编解码器 + HWSP0001 扬声器功放）。
 > 本方案**完全在用户空间完成，无需重新编译内核**。
+> 本项目初始代码来自上游 [MaximushkaBed/huawei-matebook-d15-speaker-fix](https://github.com/MaximushkaBed/huawei-matebook-d15-speaker-fix)。上游解决了 HWSP0001 功放在 Linux 下「扬声器一直无声」的问题；本仓库在此基础上增加了耳机插拔时扬声器自动静音/恢复的联动控制，并完善了参数自动探测、防爆音音量保护与内核无关性验证。
 
 ## 1. 原理与问题
 

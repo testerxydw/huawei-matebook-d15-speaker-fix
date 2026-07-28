@@ -2,6 +2,7 @@
 
 > Target: Huawei MateBook D15 `BoF-XX` (same family as `BOD-WXX9`, all using the ES8336 codec + HWSP0001 speaker amplifier).
 > This solution is **entirely in user space — no kernel recompilation required**.
+> The initial code comes from the upstream project [MaximushkaBed/huawei-matebook-d15-speaker-fix](https://github.com/MaximushkaBed/huawei-matebook-d15-speaker-fix). The upstream fixed the "speaker always silent" issue on HWSP0001 under Linux; this repo additionally adds headphone plug/unplug auto-mute/restore linkage, plus auto-detection, pop protection, and kernel-independence verification.
 
 ## 1. Background
 
