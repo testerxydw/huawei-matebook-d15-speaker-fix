@@ -1,7 +1,7 @@
 [Unit]
 Description=Huawei MateBook (BOD-WXX9 / BoF-XX) HWSP0001 speaker amp jack-aware mute
-After=sound.target
-Wants=sound.target
+After=pipewire.service pipewire-pulse.service sound.target
+Wants=pipewire.service pipewire-pulse.service sound.target
 
 [Service]
 Type=simple
