@@ -28,6 +28,12 @@ SPK_VOL_NUMID=${SPK_VOL_NUMID:-}  # 留空 -> 自动探测扬声器音量控件
 SPK_VOL_DEFAULT=${SPK_VOL_DEFAULT:-70}   # 仅供说明；音量不会被强制设置（仅在拔耳机时清零）
 HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL:-60}  # 健康检查间隔（秒），默认60秒
 POLL_INTERVAL=${POLL_INTERVAL:-5}  # 轮询兜底间隔（秒），默认5秒；同时也是 input event 监听的再校准周期
+# jack 状态变化后，延迟多少秒再操作功放 I2C / PipeWire 音量。
+# 实证发现：拔/插耳机瞬间内核 DAPM 正在操作 ES8336 codec 的 HP 电源域寄存器
+# （0x15/0x17/0x18 翻转），此时脚本同时写功放 I2C + runuser wpctl 可能与内核
+# SOF IPC 的 codec 寄存器访问产生时序竞争，长期累积导致 codec jack-detect IRQ
+# 线程卡死（jack 检测运行期死亡）。此延迟让内核 DAPM 先完成电源域切换。
+AMP_SETTLE_DELAY=${AMP_SETTLE_DELAY:-1.5}
 # ------------------------------------------------
 
 # ---------- DMI 机型识别：决定是否需要用户态操控 GPIO ----------
@@ -658,6 +664,12 @@ apply() {
     local transition=0
     [ "$jack" != "$PREV" ] && transition=1
 
+    # jack 状态变化时，先等待内核 DAPM 完成 ES8336 HP 电源域切换，
+    # 再操作功放 I2C / PipeWire 音量，避免时序竞争导致 codec IRQ 卡死。
+    if [ "$transition" = "1" ] && [ -n "$PREV" ]; then
+        sleep "$AMP_SETTLE_DELAY"
+    fi
+
     # 耳机插入 -> 功放关闭；否则功放开启
     local want=1
     [ "$jack" = "on" ] && want=0
@@ -727,8 +739,38 @@ health_check() {
     # jack 检测通道设备级存活检查（捕获设备消失/不可读这类硬失效）
     # 设备不可读 => 联动彻底失效，弹系统级告警（去重：已告警则不再刷屏）。
     # 设备恢复可读 => 重置去重标志，下次再死可重新告警。
+    # 额外：通过 IRQ 计数停滞检测"设备可读但内核静默冻结"——这是 BoF-XX 上
+    # 更常见的死亡模式（设备节点存活、但零 SW 事件、ALSA 控件卡死）。
+    # 方法：读取 jack-detect GPIO 对应的中断计数，若连续 2 个健康检查周期
+    # 计数零增长 + amixer jack 值不变，则判定 jack 检测已冻结。
     if check_jack_detection; then
-        JACK_ALERT_RAISED=0
+        # 设备可读，进一步检查 IRQ 计数是否停滞
+        local irq_now irq_stuck
+        irq_now=$(grep -i "gpio" /proc/interrupts 2>/dev/null \
+                  | awk '{sum+=$2} END{print sum}')
+        irq_now=${irq_now:-0}
+        if [ -n "${LAST_IRQ_COUNT:-}" ] 2>/dev/null; then
+            if [ "$irq_now" = "$LAST_IRQ_COUNT" ]; then
+                # IRQ 计数未增长：可能 jack 检测已冻结
+                # 二次确认：读 amixer jack 值，若也卡死不变则确认为冻结
+                local jack_now
+                jack_now=$(read_jack)
+                if [ "$jack_now" = "${LAST_JACK_FOR_IRQ:-}" ]; then
+                    irq_stuck=1
+                fi
+            fi
+        fi
+        LAST_IRQ_COUNT=$irq_now
+        LAST_JACK_FOR_IRQ=$(read_jack)
+
+        if [ "${irq_stuck:-0}" = "1" ] && [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
+            # IRQ 计数停滞 + jack 值不变 => jack 检测冻结
+            JACK_ALERT_RAISED=1
+            echo "[$(date '+%F %T')] 健康检查：jack 检测 IRQ 计数停滞 (IRQ=$irq_now)，疑似冻结" >&2
+            notify_jack_dead
+        elif [ "${irq_stuck:-0}" != "1" ]; then
+            JACK_ALERT_RAISED=0
+        fi
     else
         if [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
             JACK_ALERT_RAISED=1
