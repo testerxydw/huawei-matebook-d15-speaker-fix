@@ -482,6 +482,67 @@ read_jack() {
         | sed -n 's/^[[:space:]]*: values=//p'
 }
 
+# ---- jack 检测通道设备级存活检查（捕获设备消失/不可读这类硬失效） ----
+# 注意：此函数只能判定"设备节点是否可读"，无法发现"设备可读但内核静默冻结"
+# （静默冻结需真实插拔才暴露，见 status 子命令提示）。
+# 返回 0=事件设备可读；非0=设备不可读。
+check_jack_detection() {
+    local dev
+    dev=$(detect_input_jack_dev)
+    [ -n "$dev" ] && [ -r "$dev" ] && return 0
+    return 1
+}
+
+# ---- 桌面/系统级告警：jack 检测死亡时通知用户（多层级兜底） ----
+# 层级：①桌面通知(notify-send，以桌面用户身份发) → ②wall 广播给所有 TTY
+#       → ③logger 写系统日志（持久可查）。
+# 自动探测桌面用户（优先复用已探测的 PW_USER，否则扫描 /run/user 下持有
+# DISPLAY 或 wayland socket 的用户），确保弹窗落到正确的图形会话。
+JACK_ALERT_RAISED=0   # 去重：已弹过告警则不再刷屏，直到恢复后重置
+notify_jack_dead() {
+    local msg="耳机插拔检测(jack)已失效：耳机插拔联动静音将不起作用，需整机重启恢复音频。"
+    local ts; ts=$(date '+%F %T')
+
+    # ① 桌面通知（critical 级，置顶+提示音）
+    local u pw_dir disp addr sent=1
+    for u in "${PW_USER:-}" ""; do
+        [ -n "$u" ] || {
+            # 自动探测：持有 DISPLAY 或 wayland socket 的用户
+            for pw_dir in /run/user/*; do
+                [ -S "$pw_dir/dbus-1" ] || [ -S "$pw_dir/bus" ] || continue
+                u=$(stat -c '%U' "$pw_dir/dbus-1" 2>/dev/null \
+                    || stat -c '%U' "$pw_dir/bus" 2>/dev/null)
+                [ -n "$u" ] && break
+            done
+        }
+        [ -n "$u" ] || break
+        pw_dir="/run/user/$(id -u "$u" 2>/dev/null)"
+        [ -d "$pw_dir" ] || continue
+        addr="unix:path=$pw_dir/bus"
+        [ -S "$pw_dir/bus" ] || addr="unix:path=$pw_dir/dbus-1"
+        disp=":0"
+        [ -n "$DISPLAY" ] && disp="$DISPLAY"
+        if command -v runuser >/dev/null 2>&1 && command -v notify-send >/dev/null 2>&1; then
+            runuser -u "$u" -- env DISPLAY="$disp" XDG_RUNTIME_DIR="$pw_dir" \
+                DBUS_SESSION_BUS_ADDRESS="$addr" \
+                notify-send -u critical -a huawei-speaker-mute \
+                "耳机检测失效" "$msg" 2>/dev/null && sent=0
+        fi
+        [ "$sent" = "0" ] && break
+    done
+
+    # ② wall 广播给所有登录 TTY（不依赖桌面）
+    if command -v wall >/dev/null 2>&1; then
+        echo "[$ts] $msg (需整机重启恢复)" | wall 2>/dev/null || true
+    fi
+
+    # ③ 写系统日志（持久可查）
+    if command -v logger >/dev/null 2>&1; then
+        logger -t huawei-speaker-mute -p user.crit "jack 检测失效：$msg"
+    fi
+    echo "[$ts] 已发出 jack 检测失效告警（桌面通知/广播/日志）" >&2
+}
+
 # ---- 解析参数 ----
 CMD="${1:-}"
 I2C_BUS=$(detect_i2c); [ -n "$I2C_BUS" ] || { echo "错误：找不到 HWSP0001 的 I2C 总线" >&2; exit 1; }
@@ -534,6 +595,12 @@ case "$CMD" in
         echo "GPIO 供电进程存活"
     else
         echo "GPIO 供电进程未启动"
+    fi
+    # jack 检测通道存活（设备级）；注意静默冻结需真实插拔才暴露
+    if check_jack_detection >/dev/null 2>&1; then
+        echo "jack 检测通道：设备可读（若插拔无反应，可能内核静默冻结，需重启恢复）"
+    else
+        echo "jack 检测通道：异常（设备不可读），耳机插拔联动可能已失效"
     fi
     exit 0
     ;;
@@ -655,6 +722,18 @@ health_check() {
             fi
         done
         echo "[$(date '+%F %T')] 健康检查：功放寄存器恢复失败" >&2
+    fi
+
+    # jack 检测通道设备级存活检查（捕获设备消失/不可读这类硬失效）
+    # 设备不可读 => 联动彻底失效，弹系统级告警（去重：已告警则不再刷屏）。
+    # 设备恢复可读 => 重置去重标志，下次再死可重新告警。
+    if check_jack_detection; then
+        JACK_ALERT_RAISED=0
+    else
+        if [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
+            JACK_ALERT_RAISED=1
+            notify_jack_dead
+        fi
     fi
 
     # 如果 PipeWire 用户还未探测到，重试（应对开机时用户会话未就绪）

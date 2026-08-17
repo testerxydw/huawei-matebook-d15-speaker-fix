@@ -39,7 +39,7 @@ dmesg 启动期有 `sof ... ipc tx error -5`（SOF 固件 IPC 失败）。jack �
 | 候选 | 做法 | 可行性 | 状态 |
 |------|------|--------|------|
 | P1 模块重载 | `modprobe -r/modprobe snd_soc_sof_es8336` | ❌ 已证伪：GPIO EBUSY 阻塞 | 排除 |
-| P2 PCI 设备 sysfs 重绑 | `echo 1 > /sys/bus/pci/devices/0000:00:1f.3/remove` 后 `rescan`，强制整设备断电再上电，可能释放 ACPI GPIO | ❓ 未验证（重绑可能同样 EBUSY，或能绕过） | **需实验** |
+| P2 PCI 设备 sysfs 重绑 | `echo 1 > /sys/bus/pci/devices/0000:00:1f.3/remove` 后 `rescan`，强制整设备断电再上电，可能释放 ACPI GPIO | ❌ **已证伪（2026-08-17 14:35 Q1 实验）**：remove 后 `no soundcards`，rescan 后 card0 仍无，dmesg 报 `headphone-enable GPIO EBUSY`（error -16），与 P1 同源 | 排除 |
 | P3 DSDT / 驱动补丁 | 让 SOF/es8336 驱动**不申请** `speakers/headphone-enable` GPIO（改由 BIOS 独占），消除 EBUSY → 使 P1/P2 可用；可能顺带稳定 jack 检测 | ⚠️ 重：需自定义内核模块/ACPI 表、签名、随内核更新维护 | 候选（针对"重载阻塞"，未必治本） |
 | P4 替代检测源 | 绕开死的 ALSA 控件，找其它插拔信号：codec JD 引脚（debugfs）、或用户态读 GPIO（若 ACPI 允许 `gpiod` 读） | ❓ 未验证；BoF-XX 上 GPIO 被 ACPI 独占，gpiod 大概率读不到 | **需实验** |
 | P5 接受仅能重启 | watchdog 改为告警 + 可选自动重启 | ✅ 可行但与"避免重启"诉求冲突 | 降级兜底 |
@@ -85,6 +85,20 @@ dmesg 启动期有 `sof ... ipc tx error -5`（SOF 固件 IPC 失败）。jack �
 
 ---
 
+## 7. Q1 实验结果（2026-08-17 14:35）
+
+- **做法**：停 pipewire + 禁 socket（/dev/snd 占用=0）→ PCI `remove` 0000:00:1f.3 → `rescan`。
+- **结果**：`remove` 后 `no soundcards`；`rescan` 后 **card0 仍无**；dmesg 报 `sof-essx8336: error -EBUSY: could not get headphone-enable GPIO`（error -16）。
+- **结论**：`headphone-enable` / `speakers-enable` GPIO 被 **ACPI/BIOS 持久独占**，既不被模块卸载释放、也不被 PCI 重枚举释放。任何"内核态 reload 驱动"路径（P1/P2）都**无法**软恢复声卡。
+- **唯一能恢复的手段**：整机重启（重启重新初始化 ACPI，驱动重新拿到 GPIO）。
+- **对需求的影响**：jack 检测软恢复**不能靠驱动重载实现**；剩余可行路径仅：
+  - **P3（重）**：DSDT override / 内核 SOF 驱动补丁，让驱动**不申请**这批 GPIO（改由 BIOS 独占），从而消除 EBUSY——可能使 P1/P2 类重载可行，但工作量重、需随内核更新维护，且**不保证能阻止运行期 jack 死亡**（§1.3）。
+  - **P4（待验）**：替代检测源（codec JD 引脚 debugfs / 用户态读 GPIO），绕过死的 ALSA 控件；但 BoF-XX ACPI 独占 GPIO，gpiod 大概率读不到，待验。
+  - **P5（兜底）**：接受"仅能整机重启"，watchdog 改为告警/自动重启——与"避免重启"诉求冲突。
+- **当前状态**：声卡因本实验再次消失（`no soundcards`），需用户整机重启恢复。在 P3/P4 未验证前，**禁止再尝试任何内核态重载**（必致声卡消失且需重启）。
+
+---
+
 ## 6. 重启后已知现象与相邻问题（非本需求范畴，记录备查）
 
 ### 6.1 重启后 jack 检测已恢复（关键确认）
@@ -106,3 +120,27 @@ dmesg 启动期有 `sof ... ipc tx error -5`（SOF 固件 IPC 失败）。jack �
 ### 6.4 关于手动采样出现的 `on/on/off` 连续状态
 - 用户实测末尾出现两次连续 `on` 再 `off`：经澄清，**这是手动采样时序，非 jack 抖动**。用户两次都是在"插入耳机后"才敲 `amixer` 查看，故先看到一串 `on`，拔出后才翻 `off`；中间 `on/off` 交替同理（插着看一次、拔了看一次）。
 - 结论：**jack 检测当前完全正常，不存在内核抖动**。脚本 `jack_monitor` 主通道是实时监听，不受手动查看节奏影响，无需特殊处理。本条仅为澄清误判，不作为问题记录。
+
+---
+
+## 8. 死亡告警（已实施，不依赖软恢复）
+
+> 由于软恢复（P1–P4）均不可行/未验证，唯一恢复手段是整机重启。
+> 但在"运行期死亡 → 用户发现 → 手动重启"这段窗口里，插拔联动静音完全失效，
+> 用户可能很久才发现。因此新增**系统级告警**，让用户在几十秒内察觉 jack 已死。
+
+### 8.1 告警触发点
+- 复用现有 `health_check`（每 `HEALTH_CHECK_INTERVAL`=60s 一次）：
+  - `check_jack_detection`（设备级存活）判定事件设备**不可读**时，认为 jack 联动已失效。
+  - **去重**：`JACK_ALERT_RAISED` 标志，已告警则不再刷屏；设备恢复可读后自动重置，下次死亡可重新告警。
+- `status` 子命令仅做只读报告，**不触发**弹窗（避免手动查状态误弹)。
+
+### 8.2 告警通道（多层级兜底，2026-08-17 实测全部生效）
+1. **桌面通知（首选，critical 级）**：以桌面用户身份（`runuser -u <user>` + `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` 注入）调 `notify-send -u critical`。自动探测桌面用户（优先 `PW_USER`，否则扫描 `/run/user/*` 持有 `dbus-1`/`bus` socket 的用户）。
+2. **`wall` 广播**：发给所有登录 TTY（不依赖桌面环境，本机 tty1 必收）。
+3. **`logger -t huawei-speaker-mute -p user.crit`**：写入系统日志（`journalctl` 持久可查）。
+
+### 8.3 环境适配
+- 本机：`XDG_SESSION_TYPE=x11`、用户 `dp25`(uid 1000)、`DISPLAY=:0`、`notify-send`/`zenity`/`dbus-send`/`wall` 均可用。
+- 无图形会话（纯服务器/SSH）：第①层自动跳过，仍由 `wall` + `logger` 兜底。
+- 注意：脚本以 root（systemd service）运行，桌面属于普通用户，弹窗必须经过该用户的 DBus 会话，不能由 root 直接 `notify-send`。
