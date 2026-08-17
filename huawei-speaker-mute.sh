@@ -745,11 +745,13 @@ health_check() {
     # 计数零增长 + amixer jack 值不变，则判定 jack 检测已冻结。
     if check_jack_detection; then
         # 设备可读，进一步检查 IRQ 计数是否停滞
-        local irq_now irq_stuck
+        # irq_stuck 显式初始化为 0：避免依赖 ${var:-0} 默认展开语义，
+        # 同时保证每次函数调用都重置为未停滞状态（上一次=1不会污染下次）。
+        local irq_now irq_stuck=0
         irq_now=$(grep -i "gpio" /proc/interrupts 2>/dev/null \
                   | awk '{sum+=$2} END{print sum}')
         irq_now=${irq_now:-0}
-        if [ -n "${LAST_IRQ_COUNT:-}" ] 2>/dev/null; then
+        if [ -n "${LAST_IRQ_COUNT:-}" ]; then
             if [ "$irq_now" = "$LAST_IRQ_COUNT" ]; then
                 # IRQ 计数未增长：可能 jack 检测已冻结
                 # 二次确认：读 amixer jack 值，若也卡死不变则确认为冻结
@@ -763,12 +765,12 @@ health_check() {
         LAST_IRQ_COUNT=$irq_now
         LAST_JACK_FOR_IRQ=$(read_jack)
 
-        if [ "${irq_stuck:-0}" = "1" ] && [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
+        if [ "$irq_stuck" = "1" ] && [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
             # IRQ 计数停滞 + jack 值不变 => jack 检测冻结
             JACK_ALERT_RAISED=1
             echo "[$(date '+%F %T')] 健康检查：jack 检测 IRQ 计数停滞 (IRQ=$irq_now)，疑似冻结" >&2
             notify_jack_dead
-        elif [ "${irq_stuck:-0}" != "1" ]; then
+        elif [ "$irq_stuck" != "1" ]; then
             JACK_ALERT_RAISED=0
         fi
     else
