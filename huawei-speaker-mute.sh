@@ -34,6 +34,13 @@ POLL_INTERVAL=${POLL_INTERVAL:-5}  # 轮询兜底间隔（秒），默认5秒；
 # SOF IPC 的 codec 寄存器访问产生时序竞争，长期累积导致 codec jack-detect IRQ
 # 线程卡死（jack 检测运行期死亡）。此延迟让内核 DAPM 先完成电源域切换。
 AMP_SETTLE_DELAY=${AMP_SETTLE_DELAY:-1.5}
+# 防死亡 debounce：1分钟内拔插次数超过此阈值时，暂停响应 DEBOUNCE_SUSPEND_SECONDS 秒。
+# 实证发现：1分钟内频繁拔插 ≥6次会导致 ES8336 codec jack-detect IRQ 硬件锁死
+# （GPIO 81 物理线路冻结，codec 软重置也无法恢复）。debounce 通过主动减少脚本
+# 响应来降低与内核 DAPM/codec 驱动的时序竞争，防止硬件锁死。
+DEBOUNCE_WINDOW=${DEBOUNCE_WINDOW:-60}       # 统计窗口（秒）
+DEBOUNCE_MAX_EVENTS=${DEBOUNCE_MAX_EVENTS:-3}  # 窗口内最大允许变化次数
+DEBOUNCE_SUSPEND_SECONDS=${DEBOUNCE_SUSPEND_SECONDS:-30}  # 触发后暂停秒数
 # ------------------------------------------------
 
 # ---------- DMI 机型识别：决定是否需要用户态操控 GPIO ----------
@@ -661,11 +668,57 @@ echo "使用参数：I2C_BUS=$I2C_BUS  JACK_NUMID=$JACK_NUMID  GPIO $GPIOCHIP �
 # 扬声器音量只在"真正拔掉耳机"的跳变时强制设为 0（静音）。
 PREV=
 CUR_AMP=
+# debounce 状态变量（防止频繁拔插导致 codec 硬件锁死）：
+# JACK_EVENT_TIMES: 环形存储最近几次 jack 变化的 epoch 秒时间戳
+# SUSPEND_UNTIL:    暂停截止 epoch 秒；<=当前时间表示未暂停
+JACK_EVENT_TIMES=()
+SUSPEND_UNTIL=0
+
 apply() {
     local jack
     jack=$(read_jack)
     local transition=0
     [ "$jack" != "$PREV" ] && transition=1
+
+    # ---- debounce 暂停检查（最高优先级，先判断是否在暂停期）----
+    local now
+    now=$(date +%s)
+    if [ "$now" -lt "$SUSPEND_UNTIL" ]; then
+        # 暂停期间跳过所有响应（不再操作功放 I2C / PipeWire / runuser）
+        # 但 PREV 必须同步更新，否则暂停结束后会把暂停期间积累的变化一次性处理
+        PREV=$jack
+        return 0
+    fi
+    # 暂停已结束：清理旧事件时间戳
+    if [ "$SUSPEND_UNTIL" -gt 0 ]; then
+        JACK_EVENT_TIMES=()
+        SUSPEND_UNTIL=0
+    fi
+
+    # ---- debounce 事件计数（仅非暂停期的变化才计数）----
+    if [ "$transition" = "1" ]; then
+        JACK_EVENT_TIMES+=("$now")
+
+        # 清理超出窗口的旧时间戳
+        local ev
+        local new_times=()
+        for ev in "${JACK_EVENT_TIMES[@]}"; do
+            if [ $((now - ev)) -le "$DEBOUNCE_WINDOW" ]; then
+                new_times+=("$ev")
+            fi
+        done
+        JACK_EVENT_TIMES=("${new_times[@]}")
+
+        # 窗口内事件数超阈值 → 触发暂停
+        local count=${#JACK_EVENT_TIMES[@]}
+        if [ "$count" -gt "$DEBOUNCE_MAX_EVENTS" ]; then
+            SUSPEND_UNTIL=$((now + DEBOUNCE_SUSPEND_SECONDS))
+            echo "[$(date '+%F %T')] 防死亡 debounce：${DEBOUNCE_WINDOW}秒内${count}次拔插，暂停响应${DEBOUNCE_SUSPEND_SECONDS}秒（至$(date -d "@$SUSPEND_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "N/A")）" >&2
+            echo "[$(date '+%F %T')] 防死亡 debounce：暂停中..." >&2
+            PREV=$jack
+            return 0
+        fi
+    fi
 
     # jack 状态变化时，先等待内核 DAPM 完成 ES8336 HP 电源域切换，
     # 再操作功放 I2C / PipeWire 音量，避免时序竞争导致 codec IRQ 卡死。
