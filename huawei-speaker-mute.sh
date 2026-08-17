@@ -866,8 +866,31 @@ trap cleanup TERM INT
 # 始终先启动功放供电 GPIO（BoF-XX 机型为 NO-OP，不会破坏 BIOS 状态）
 start_gpioset
 
-# 首次应用状态
-apply
+# ---- 启动时功放状态检测：避免对已在工作的功放回灌寄存器引起白噪音 ----
+# BoF-XX 机型 BIOS 开机时已初始化功放（reg 0x01 = 0x69），若直接执行 set_amp(1)
+# 会在功放正在播放音频时回灌 27 个寄存器（包括静音/增益切换），产生白噪音瞬态。
+# 这里先读取功放当前状态：若已在目标状态则直接设置 CUR_AMP 跳过 reinit。
+_init_amp_state() {
+    local jack want expected
+    jack=$(read_jack)
+    want=1
+    [ "$jack" = "on" ] && want=0
+    expected="0x00"
+    [ "$want" = "1" ] && expected="0x69"
+    local val
+    val=$(sudo i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
+    val=${val:-fail}
+    if [ "$val" = "$expected" ]; then
+        # 功放已在期望状态，跳过 reinit 防止白噪音
+        CUR_AMP=$want
+        echo "[$(date '+%F %T')] 启动检测：功放已在期望状态 (0x58.01=$val, jack=$jack)，跳过 I2C 回放"
+        return 0
+    else
+        echo "[$(date '+%F %T')] 启动检测：功放状态不匹配 (0x58.01=$val, 期望$expected)，将执行 I2C 回放"
+        return 1
+    fi
+}
+_init_amp_state || apply
 
 # ---- 启动健康检查后台循环 ----
 # 注意：子 shell 中的 health_check 直接从 ALSA 读取 jack 状态，
