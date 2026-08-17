@@ -796,39 +796,35 @@ health_check() {
     # 设备不可读 => 联动彻底失效，弹系统级告警（去重：已告警则不再刷屏）。
     # 设备恢复可读 => 重置去重标志，下次再死可重新告警。
     # 额外：通过 IRQ 计数停滞检测"设备可读但内核静默冻结"——这是 BoF-XX 上
-    # 更常见的死亡模式（设备节点存活、但零 SW 事件、ALSA 控件卡死）。
-    # 方法：读取 jack-detect GPIO 对应的中断计数，若连续 2 个健康检查周期
-    # 计数零增长 + amixer jack 值不变，则判定 jack 检测已冻结。
+    # 更常见的死亡模式（设备节点存活、但零 SW 事件）。
+    # 方法：读取 jack-detect GPIO 对应的中断计数，若连续 3 个健康检查周期
+    # (3分钟) 计数零增长，则判定 jack 检测已冻结。
+    # 注意：amixer kcontrol 值在 BoF-XX 上不可靠（snd_ctl_notify 缺失），
+    # 不能用于二次确认；仅用 IRQ 计数增长判断 jack 是否活着。
     if check_jack_detection; then
-        # 设备可读，进一步检查 IRQ 计数是否停滞
-        # irq_stuck 显式初始化为 0：避免依赖 ${var:-0} 默认展开语义，
-        # 同时保证每次函数调用都重置为未停滞状态（上一次=1不会污染下次）。
         local irq_now irq_stuck=0
-        # 精确匹配 es8316 jack-detect 中断行（避免匹配到无关 gpio 行），
-        # 累加所有 CPU 列的计数（多核系统 GPIO 中断可能被路由到任意核，
-        # 之前只取 $2=CPU0 列导致多核机器上永远读到 0 → 0=0 误判为冻结）。
         irq_now=$(grep "es8316" /proc/interrupts 2>/dev/null \
                   | head -1 \
                   | awk '{sum=0; for(i=2;i<=NF-3;i++) sum+=$i; print sum}')
         irq_now=${irq_now:-0}
-        if [ -n "${LAST_IRQ_COUNT:-}" ]; then
+        # 仅当 IRQ 曾经 >0（说明 jack 检测曾工作过）后才启用停滞检测。
+        # 开机后无人拔插时 IRQ=0 是正常的，不能误判为"停滞"。
+        if [ -n "${LAST_IRQ_COUNT:-}" ] && [ "${LAST_IRQ_COUNT:-0}" -gt 0 ]; then
             if [ "$irq_now" = "$LAST_IRQ_COUNT" ]; then
-                # IRQ 计数未增长：可能 jack 检测已冻结
-                # 二次确认：读 amixer jack 值，若也卡死不变则确认为冻结
-                local jack_now
-                jack_now=$(read_jack)
-                if [ "$jack_now" = "${LAST_JACK_FOR_IRQ:-}" ]; then
-                    irq_stuck=1
-                fi
+                IRQ_STALL_COUNT=$((IRQ_STALL_COUNT + 1))
+            else
+                IRQ_STALL_COUNT=0
+            fi
+            # 连续 3 个周期（3分钟）IRQ 计数零增长才判为冻结
+            if [ "${IRQ_STALL_COUNT:-0}" -ge 3 ]; then
+                irq_stuck=1
             fi
         fi
         LAST_IRQ_COUNT=$irq_now
-        LAST_JACK_FOR_IRQ=$(read_jack)
 
         if [ "$irq_stuck" = "1" ] && [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
-            # IRQ 计数停滞 + jack 值不变 => jack 检测冻结
             JACK_ALERT_RAISED=1
-            echo "[$(date '+%F %T')] 健康检查：jack 检测 IRQ 计数停滞 (IRQ=$irq_now)，疑似冻结" >&2
+            echo "[$(date '+%F %T')] 健康检查：jack IRQ 计数连续 3 周期停滞 (IRQ=$irq_now)，疑似冻结" >&2
             notify_jack_dead
         elif [ "$irq_stuck" != "1" ]; then
             JACK_ALERT_RAISED=0
