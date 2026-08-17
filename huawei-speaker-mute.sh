@@ -373,6 +373,9 @@ set_speaker_vol() {
 # 把"多次 set-volume 0 以应对 WirePlumber 音量恢复竞态"放进同一个 runuser 会话内完成，
 # 避免每次 unplug 触发多次 PAM 会话（日志中可见 session opened/closed 刷屏）。
 set_pw_vol() {
+    # PW_USER 可能在 health_check 子 shell 中被探测到，但子 shell 的变量
+    # 不会传回主 shell。这里做兜底：如果主 shell 的 PW_USER 为空，实时探测一次。
+    [ -n "$PW_USER" ] || detect_pw
     [ -n "$PW_USER" ] || return 0
     runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" PW_VOL_TARGET="$1" bash -c '
         for i in 1 2 3; do
@@ -748,8 +751,12 @@ health_check() {
         # irq_stuck 显式初始化为 0：避免依赖 ${var:-0} 默认展开语义，
         # 同时保证每次函数调用都重置为未停滞状态（上一次=1不会污染下次）。
         local irq_now irq_stuck=0
-        irq_now=$(grep -i "gpio" /proc/interrupts 2>/dev/null \
-                  | awk '{sum+=$2} END{print sum}')
+        # 精确匹配 es8316 jack-detect 中断行（避免匹配到无关 gpio 行），
+        # 累加所有 CPU 列的计数（多核系统 GPIO 中断可能被路由到任意核，
+        # 之前只取 $2=CPU0 列导致多核机器上永远读到 0 → 0=0 误判为冻结）。
+        irq_now=$(grep "es8316" /proc/interrupts 2>/dev/null \
+                  | head -1 \
+                  | awk '{sum=0; for(i=2;i<=NF-3;i++) sum+=$i; print sum}')
         irq_now=${irq_now:-0}
         if [ -n "${LAST_IRQ_COUNT:-}" ]; then
             if [ "$irq_now" = "$LAST_IRQ_COUNT" ]; then
