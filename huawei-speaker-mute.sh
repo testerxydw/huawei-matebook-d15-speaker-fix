@@ -515,7 +515,7 @@ notify_jack_dead() {
                 [ -n "$u" ] && break
             done
         }
-        [ -n "$u" ] || break
+        [ -n "$u" ] || continue
         pw_dir="/run/user/$(id -u "$u" 2>/dev/null)"
         [ -d "$pw_dir" ] || continue
         addr="unix:path=$pw_dir/bus"
