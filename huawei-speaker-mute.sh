@@ -564,7 +564,10 @@ if [ "${NEEDS_GPIO:-1}" = "0" ]; then
 else
     _GPIO_NOTE="(DMI=[${DMI_PRODUCT:-unknown}/${DMI_BOARD:-unknown}] → 用户态拉功放 GPIO 供电)"
 fi
-echo "使用参数：I2C_BUS=$I2C_BUS  JACK_NUMID=$JACK_NUMID  GPIO $GPIOCHIP 线号 $GPIO_LINE  NEEDS_GPIO=${NEEDS_GPIO:-1} $_GPIO_NOTE  SPK_VOL_NUMID=${SPK_VOL_NUMID:-none}  PipeWire 用户=${PW_USER:-none}  健康检查间隔=${HEALTH_CHECK_INTERVAL}s  轮询间隔=${POLL_INTERVAL}s"
+echo "使用参数：I2C_BUS=$I2C_BUS  JACK_NUMID=$JACK_NUMID  GPIO $GPIOCHIP 线号 $GPIO_LINE" \
+     " NEEDS_GPIO=${NEEDS_GPIO:-1} $_GPIO_NOTE" \
+     " SPK_VOL_NUMID=${SPK_VOL_NUMID:-none}  PipeWire 用户=${PW_USER:-none}" \
+     " 健康检查间隔=${HEALTH_CHECK_INTERVAL}s  轮询间隔=${POLL_INTERVAL}s"
 [ -n "$JACK_INPUT_DEV" ] \
     && echo "耳机插拔监听通道：input event ($JACK_INPUT_DEV) + 轮询（主）；alsactl monitor（次）" \
     || echo "耳机插拔监听通道：未检测到 input event 设备，使用 alsactl monitor + 轮询"
