@@ -7,30 +7,36 @@
 ## 1. 原理与问题
 
 - **扬声器**由 `HWSP0001` 功放驱动（I2C 总线运行时自动探测，本机为 `i2c-3`，地址 `0x58`/`0x5B`）；**耳机**走 `ES8336` 编解码器独立路径，二者互不依赖。
-- `HWSP0001` 没有 Linux 驱动：BoF-XX 开机时功放处于静音默认态，需通过 I2C 回放一组“使能”寄存器（`reinit_amp`）才能出声。
+- `HWSP0001` 没有 Linux 驱动：功放开机处于静音默认态，需通过 I2C 回放一组“使能”寄存器（`reinit_amp`）才能出声。
 - 功放提供**软静音寄存器 `0x01`**：
   - 写 `0x00` → **仅静音扬声器**，耳机照常响（已实测验证）；
   - 写 `0x69` → 恢复扬声器。
-- 系统可通过 `alsactl monitor hw:0` 监听 ALSA `Headphone Jack` 控件来感知插拔。
+- 插拔事件通过三级通道监听（见第 2 节）：主通道为 `sof_es8336` 驱动创建的 input 事件设备（`/dev/input/eventN` 的 `SW_HEADPHONE_INSERT`），辅以周期轮询与 `alsactl monitor` 兜底。
 
-**原缺陷**：自动脚本在“插入耳机”时去翻转功放供电 GPIO（`gpio-145`），但该方式在本机并不能真正静音扬声器，导致“插入耳机扬声器仍有声音 / 开机插耳机扬声器持续发声”。
+**机型差异（关键）**：功放供电 GPIO 是否需要用户态操控，因机型而异，脚本通过 DMI 自动判断：
+- **BoF-XX 等新机型**：BIOS 开机已完成功放 GPIO 供电，用户态若再用 `gpioset` 拉该线，反而破坏 BIOS 建立的引脚状态、导致功放 I2C 永久不可访问（必须重启）。脚本判定 `NEEDS_GPIO=0`，**完全不碰 GPIO**。
+- **BOD-WXX9 / BOHB-WAX9 等老机型**：BIOS 不初始化功放 GPIO，必须由用户态 `gpioset` 持续拉高供电脚，功放 I2C 才可访问。脚本判定 `NEEDS_GPIO=1`。
 
-**修复思路**：把“静音扬声器”的动作改为写功放软静音寄存器 `0x01=0x00`（只影响扬声器、不影响耳机），由用户空间脚本在插拔时自动执行。
+**原缺陷**：早期脚本在“插入耳机”时去翻转功放供电 GPIO 以图静音，但该方式既不能真正静音扬声器（GPIO 与功放静音无关），在 BoF-XX 上还会破坏 BIOS 已建立的 GPIO 状态。
+
+**修复思路**：把“静音扬声器”的动作改为写功放软静音寄存器 `0x01=0x00`（只影响扬声器、不影响耳机），由用户空间脚本在插拔时自动执行；GPIO 是否由用户态拉取则交给 DMI 自动判定。
 
 ## 2. 具体修复项
 
-仅修改 `huawei-speaker-mute.sh` 中的 `set_amp()` 函数（其余逻辑不变）：
+脚本 `huawei-speaker-mute.sh` 在运行期完成以下工作（均为用户空间逻辑）：
 
-- **启用扬声器（`val=1`）**：确保功放供电 GPIO（`gpio-145`）常开并 `reinit_amp()` 回放使能寄存器（取消软静音）。
-- **禁用扬声器（`val=0`，即插入耳机时）**：不再翻转 `gpio-145`，而是写功放软静音寄存器：
-  ```bash
-  i2cset -y -f "$I2C_BUS" 0x58 0x01 0x00   # 软静音左声道功放
-  i2cset -y -f "$I2C_BUS" 0x5B 0x01 0x00   # 软静音右声道功放
-  ```
-  该操作只静音扬声器，耳机走 ES8336 独立路径不受影响。
-- `apply()` 逻辑保持不变：
-  - `jack=on`（插入耳机）→ `set_amp 0` → 扬声器软静音；
-  - `jack=off`（拔掉耳机）→ `set_amp 1` → 恢复扬声器，并触发 `unplug_volume_guard` 先把 PipeWire/ALSA 扬声器音量清零（避免炸响），用户随后可调大。
+- **DMI 自动判定 GPIO 策略**（`detect_dmi_gpio_needed`）：按 `product_name` 判断 `NEEDS_GPIO`。`BoF*` → `0`（不碰 GPIO）；`BOD*`/`BOH*` → `1`（用户态拉 GPIO 供电）。可用环境变量 `NEEDS_GPIO` 覆盖。
+- **插拔三级监听**（保证任何机型都不漏事件）：
+  1. 主通道：Python 监视器监听 `sof_es8336` 创建的 input 事件设备（`SW_HEADPHONE_INSERT`）+ 每 `POLL_INTERVAL` 秒轮询 ALSA 控件；
+  2. 次通道：`alsactl monitor hw:0`（部分机型可能无事件，作为兼容）；
+  3. 兜底：每 2 秒纯轮询 ALSA 控件。
+- **软静音寄存器切换**（`set_amp`）：
+  - 插入耳机（`val=0`）→ 写 `0x01=0x00`，只静音扬声器、耳机不受影响；
+  - 拔掉耳机（`val=1`）→ 拉起 GPIO 供电（仅 `NEEDS_GPIO=1`）+ `reinit_amp()` 回放使能寄存器（`0x01=0x69` 及初始化序列），并触发 `unplug_volume_guard` 先把音量清零防爆音。
+- **`reinit_amp()` 带读回验证与重试**：写入后回读 `0x01` 寄存器确认生效，失败自动重试（最多 3 次；`NEEDS_GPIO=1` 时按需重启 GPIO 供电）。
+- **健康检查后台循环**（`health_check`，每 `HEALTH_CHECK_INTERVAL` 秒，默认 60s）：检查 `gpioset` 是否存活、功放 `0x01` 寄存器是否处于合法值（插耳机时 `0x00`、否则 `0x69`），异常则自动恢复；并在 PipeWire 会话就绪后补全音量保护。
+
+常用环境变量（覆盖自动探测）：`GPIOCHIP`、`GPIO_LINE`、`JACK_NUMID`、`I2C_BUS`、`SPK_VOL_NUMID`、`NEEDS_GPIO`、`POLL_INTERVAL`、`HEALTH_CHECK_INTERVAL`。
 
 > 注：早期曾探索过内核态修复（给 `es8336` 编解码器驱动加 `JD_INVERTED` 反相补丁，目录 `es8336-jack-invert/`）。由于本机插拔事件已能被用户空间脚本稳定监听，且功放软静音可达成同等效果，**最终采用上述用户空间方案**，更简单、可即时回退、无需编译内核模块。
 
@@ -41,7 +47,9 @@
    sudo ./install.sh
    ```
    该脚本会把 `huawei-speaker-mute.sh` 安装到 `/usr/local/bin/`（若不可写则回退到 `/opt/`），并启用 `huawei-speaker-mute.service`（开机自启、自动监听插拔）。本机当前安装路径为 `/opt/huawei-speaker-mute.sh`。
-   安装程序会**先自动检测并安装运行依赖**：`i2c-tools`（`i2cset`/`i2cget`）、`alsa-utils`（`amixer`/`alsactl`）、`libgpiod`/`gpiod`（`gpioset`）、`python3`、`acpica-tools`（`iasl`）。`wpctl`/PipeWire 为可选项，缺失时仅跳过拔耳机音量保护，不影响核心静音功能。
+   安装程序会**先自动检测并安装运行依赖**：`i2c-tools`（`i2cset`/`i2cget`）、`alsa-utils`（`amixer`/`alsactl`）、`libgpiod`/`gpiod`（`gpioset`）、`python3`（**必需**，用于 DSDT 解析与 input event 监听）、`acpica-tools`（`iasl`）。`wpctl`/PipeWire 为可选项，缺失时仅跳过拔耳机音量保护，不影响核心静音功能。
+
+   仓库另含 `tools/` 目录，存放排障用诊断脚本（`jack_watch.py`、`pure_poll.py`、`event_sync_test.py`、`reg_watch.py`），其运行产生的日志已被 `.gitignore` 忽略。
 2. 立即生效（无需重启）：
    ```bash
    sudo systemctl restart huawei-speaker-mute.service
@@ -104,9 +112,10 @@ i2cget -y -f <I2C_BUS> 0x58 0x01         # <I2C_BUS> 由脚本自动探测（本
 **核心思路可复用，但脚本本身面向 HWSP0001，不能直接套到其他设备。** 分两层看：
 
 ### 可复用的框架（与具体硬件无关）
-- 用 `alsactl monitor` 监听 `Headphone Jack` 控件感知插拔；
+- 用 `alsactl monitor` + input 事件设备（`SW_HEADPHONE_INSERT`）+ 周期轮询的**三级监听**感知插拔，兜底不漏事件；
 - 插拔跳变时通过 PipeWire（`wpctl`，以桌面用户身份）清零/恢复扬声器音量，避免爆音；
-- 用 systemd 服务常驻、开机自启。
+- 通过 DMI 判定「BIOS 是否已接管功放 GPIO」（`NEEDS_GPIO`），区分需要/不需要用户态拉 GPIO 的机型；
+- 用 systemd 服务常驻、开机自启，并辅以**健康检查后台循环**自动恢复异常。
 
 这套"用户空间监听插拔 → 控制功放/音量"的范式，适用于所有"耳机与扬声器切换异常、且希望用软方式控制扬声器"的 Linux 设备。
 

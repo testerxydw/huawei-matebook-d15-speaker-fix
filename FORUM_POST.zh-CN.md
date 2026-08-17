@@ -64,25 +64,29 @@ HWSP0001 功放在 Linux 下缺失官方驱动，导致两个层面的问题：
 
 •   原因：BIOS 初始化后，功放回归默认静音态，Linux 内核无驱动接管。
 
-•   方案：通过 GPIO 上电 + I2C 回放初始化寄存器（reinit_amp）。
+•   方案：通过功放供电 GPIO 上电（老机型 BOD/BOH 需用户态 gpioset 拉供电；新机型 BoF-XX 由 BIOS 完成、用户态不碰）+ I2C 回放初始化寄存器（reinit_amp）。
 
 问题二：耳机切换逻辑断裂（本仓库解决）
 
-•   现象：插拔耳机时，扬声器与耳机状态混乱。
+•   现象：插拔耳机时，扬声器与耳机状态混乱（如插耳机扬声器仍响、开机插耳机乱响）。
 
-•   原因：系统无法通过 GPIO 控制功放静音。必须写入功放内部的软静音寄存器（0x01=0x00），而非简单的物理引脚控制。
+•   原因：系统无法通过翻转 GPIO 控制功放静音，必须写入功放内部的软静音寄存器（0x01=0x00），而非简单的物理引脚控制。
 
-•   方案：监听 ALSA 插拔事件，动态写入寄存器切换状态。
+•   方案：监听耳机插拔事件（主通道为 sof_es8336 创建的 input 事件设备 SW_HEADPHONE_INSERT + 周期轮询，辅以 alsactl monitor 兜底），动态写入软静音/恢复寄存器切换状态。
 
 ✨ 方案亮点
 
-•   纯用户空间：仅依赖 i2cset 和 alsactl，无需编译内核或加载第三方模块。
+•   纯用户空间：仅依赖 i2cset 与插拔事件监听，无需编译内核或加载第三方模块。
 
-•   智能探测：自动识别 I2C 总线、ALSA 控制项（Headphone Jack）及 GPIO 线号，开箱即用。
+•   DMI 自动判定 GPIO 策略：按机型自动决定是否需要用户态拉功放供电 GPIO。BoF-XX 等新型号 BIOS 已接管 GPIO，脚本完全不碰（否则会破坏 BIOS 状态、导致功放 I2C 失效）；BOD-WXX9 等老型号才由用户态 gpioset 拉供电。
 
-•   精准控制：仅静音 HWSP0001 功放，不影响 ES8336 管理的耳机通路。
+•   三级插拔监听：主通道监听 sof_es8336 的 input 事件（SW_HEADPHONE_INSERT）+ 周期轮询，次通道 alsactl monitor，最后每 2 秒纯轮询兜底，任何机型都不漏事件。
+
+•   精准控制：仅静音 HWSP0001 功放（写软静音寄存器 0x01=0x00），不影响 ES8336 管理的耳机通路。
 
 •   防爆音设计：拔插瞬间先将 ALSA 音量归零，待功放稳定后再恢复，杜绝“啪”声。
+
+•   健康检查后台循环：每 60 秒校验功放供电与 0x01 寄存器状态，异常自动恢复。
 
 •   高可移植：逻辑与硬件参数分离，方便适配其他类似功放。
 
@@ -130,7 +134,7 @@ sudo systemctl disable huawei-speaker-mute.service
 
 •   内核无关性：经校验，修复过程完全运行于用户空间，与 /boot/config-$(uname -r) 内核配置无关，适用于各类未修改的 Linux 发行版。
 
-•   依赖组件：i2c-tools, alsa-utils, systemd.
+•   依赖组件：i2c-tools、alsa-utils、libgpiod/gpiod、python3（必需，用于 DSDT 解析与 input event 监听）、acpica-tools；wpctl/PipeWire 为可选项，缺失仅跳过音量保护。安装脚本会自动检测并安装。
 
 🙏 致谢
 

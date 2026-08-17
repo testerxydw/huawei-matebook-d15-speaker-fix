@@ -7,28 +7,36 @@
 ## 1. Background
 
 - The **speaker** is driven by the `HWSP0001` amplifier (I2C bus auto-detected at runtime, `i2c-3` on this board, addresses `0x58`/`0x5B`); the **headphone** uses the `ES8336` codec's independent path. They are independent.
-- `HWSP0001` has no Linux driver: on BoF-XX the amplifier boots muted and must be enabled by replaying a set of I2C "enable" registers (`reinit_amp`).
+- `HWSP0001` has no Linux driver: the amplifier boots muted and must be enabled by replaying a set of I2C "enable" registers (`reinit_amp`).
 - The amplifier provides a **soft-mute register `0x01`**:
   - Write `0x00` → **mutes the speaker only**; the headphone keeps playing (verified).
   - Write `0x69` → restores the speaker.
-- Plug/unplug can be observed from user space via `alsactl monitor hw:0` on the ALSA `Headphone Jack` control.
+- Plug/unplug is observed via a **three-tier monitor** (see §2): the primary channel is the input event device created by the `sof_es8336` driver (`/dev/input/eventN`, `SW_HEADPHONE_INSERT`), backed by periodic polling and `alsactl monitor`.
 
-**The bug**: the auto script used to toggle the amplifier power GPIO (`gpio-145`) to mute the speaker on headphone insert, but on this machine that does not actually silence the speaker — hence "speaker still plays when headphones are inserted / speaker keeps playing when booting with headphones plugged".
+**Model difference (key)**: whether the amplifier power GPIO must be driven by user space depends on the model, auto-detected via DMI:
+- **BoF-XX and similar new boards**: the BIOS already powers the amplifier GPIO at boot. If user space toggles that line with `gpioset`, it breaks the BIOS-established pin state and makes the amplifier I2C permanently inaccessible (reboot required). The script sets `NEEDS_GPIO=0` and **never touches the GPIO**.
+- **BOD-WXX9 / BOHB-WAX9 and similar older boards**: the BIOS does not initialize the amplifier GPIO, so user space must keep the power line high with `gpioset` for the amplifier I2C to be accessible. The script sets `NEEDS_GPIO=1`.
 
-**Fix**: change the "mute speaker" action to write the amplifier soft-mute register `0x01=0x00` (speaker only, headphone unaffected), executed automatically by the script on plug/unplug.
+**The bug**: the early script toggled the amplifier power GPIO to mute on headphone insert, but that neither truly mutes the speaker (the GPIO is unrelated to amplifier mute) nor is safe on BoF-XX (it breaks the BIOS GPIO state).
+
+**Fix**: change the "mute speaker" action to write the amplifier soft-mute register `0x01=0x00` (speaker only, headphone unaffected), executed automatically by the script on plug/unplug; whether the GPIO is driven by user space is left to the DMI auto-detection.
 
 ## 2. Specific Fix
 
-Only `huawei-speaker-mute.sh`'s `set_amp()` was changed (logic otherwise unchanged):
+The script `huawei-speaker-mute.sh` does the following at runtime (all in user space):
 
-- **Enable speaker (`val=1`)**: keep the amplifier power GPIO (`gpio-145`) on and call `reinit_amp()` to replay enable registers (un-mute).
-- **Disable speaker (`val=0`, i.e. on headphone insert)**: instead of toggling `gpio-145`, write the soft-mute register:
-  ```bash
-  i2cset -y -f "$I2C_BUS" 0x58 0x01 0x00   # soft-mute left amplifier
-  i2cset -y -f "$I2C_BUS" 0x5B 0x01 0x00   # soft-mute right amplifier
-  ```
-  This mutes only the speaker; the headphone (ES8336 path) is unaffected.
-- `apply()` is unchanged: `jack=on` → `set_amp 0` (speaker muted); `jack=off` → `set_amp 1` (speaker restored) and `unplug_volume_guard` zeroes the PipeWire/ALSA speaker volume first (no pop), which the user can then raise.
+- **DMI-based GPIO strategy** (`detect_dmi_gpio_needed`): sets `NEEDS_GPIO` from `product_name`. `BoF*` → `0` (do not touch GPIO); `BOD*`/`BOH*` → `1` (user space drives GPIO power). Overridable via the `NEEDS_GPIO` env var.
+- **Three-tier plug/unplug monitor** (so no event is missed on any model):
+  1. Primary: a Python monitor listens on the input event device created by `sof_es8336` (`SW_HEADPHONE_INSERT`) + polls the ALSA control every `POLL_INTERVAL` seconds;
+  2. Secondary: `alsactl monitor hw:0` (compat channel, may produce no events on some models);
+  3. Fallback: pure ALSA polling every 2 seconds.
+- **Soft-mute register switch** (`set_amp`):
+  - Headphone inserted (`val=0`) → write `0x01=0x00`, muting only the speaker, headphone unaffected;
+  - Headphone removed (`val=1`) → raise GPIO power (only when `NEEDS_GPIO=1`) + `reinit_amp()` replays enable registers (`0x01=0x69` and the init sequence), and triggers `unplug_volume_guard` to zero the volume first (no pop).
+- **`reinit_amp()` with readback verification and retry**: after writing, it reads back `0x01` to confirm, retrying automatically (up to 3 times; restarting GPIO power when `NEEDS_GPIO=1`).
+- **Health-check background loop** (`health_check`, every `HEALTH_CHECK_INTERVAL` seconds, default 60s): checks whether `gpioset` is alive and whether the amplifier `0x01` register holds the expected value (`0x00` when inserted, else `0x69`), auto-recovering on anomaly; also completes volume protection once the PipeWire session becomes ready.
+
+Common env vars (override auto-detection): `GPIOCHIP`, `GPIO_LINE`, `JACK_NUMID`, `I2C_BUS`, `SPK_VOL_NUMID`, `NEEDS_GPIO`, `POLL_INTERVAL`, `HEALTH_CHECK_INTERVAL`.
 
 > Note: an in-kernel alternative was explored earlier (a `JD_INVERTED` quirk for the `es8336` codec driver, in `es8336-jack-invert/`). Because plug/unplug is already reliably observable from user space and the amplifier soft-mute achieves the same result, **the user-space script is the chosen solution** — simpler and instantly reversible, no kernel module build.
 
@@ -39,7 +47,9 @@ Only `huawei-speaker-mute.sh`'s `set_amp()` was changed (logic otherwise unchang
    sudo ./install.sh
    ```
    This installs `huawei-speaker-mute.sh` to `/usr/local/bin/` (falls back to `/opt/` if not writable) and enables `huawei-speaker-mute.service` (auto-starts, auto-monitors plug/unplug). On this machine the installed path is `/opt/huawei-speaker-mute.sh`.
-   The installer **auto-detects and installs runtime dependencies first**: `i2c-tools` (`i2cset`/`i2cget`), `alsa-utils` (`amixer`/`alsactl`), `libgpiod`/`gpiod` (`gpioset`), `python3`, `acpica-tools` (`iasl`). `wpctl`/PipeWire is optional — if missing, only the unplug volume guard is skipped; the core mute function is unaffected.
+   The installer **auto-detects and installs runtime dependencies first**: `i2c-tools` (`i2cset`/`i2cget`), `alsa-utils` (`amixer`/`alsactl`), `libgpiod`/`gpiod` (`gpioset`), `python3` (**required**, used for DSDT parsing and input-event monitoring), `acpica-tools` (`iasl`). `wpctl`/PipeWire is optional — if missing, only the unplug volume guard is skipped; the core mute function is unaffected.
+
+   The repo also ships a `tools/` directory with diagnostic scripts (`jack_watch.py`, `pure_poll.py`, `event_sync_test.py`, `reg_watch.py`); their runtime logs are ignored via `.gitignore`.
 2. Apply immediately (no reboot needed):
    ```bash
    sudo systemctl restart huawei-speaker-mute.service
@@ -99,9 +109,10 @@ This fix **does not modify any kernel file, kernel config, or kernel module**. E
 **The core idea is reusable, but the script itself targets HWSP0001 and cannot be used on other devices as-is.** Two layers:
 
 ### Reusable framework (hardware-independent)
-- Monitor plug/unplug via `alsactl monitor` on the `Headphone Jack` control;
+- A **three-tier monitor** (input event `SW_HEADPHONE_INSERT` + `alsactl monitor` + periodic polling) detects plug/unplug without missing events;
 - On transitions, mute/restore the speaker volume through PipeWire (`wpctl`, as the desktop user) to avoid pops;
-- A systemd service keeps it resident and starts at boot.
+- DMI detection of whether the BIOS already owns the amplifier GPIO (`NEEDS_GPIO`) distinguishes models that need/don't need user-space GPIO driving;
+- A systemd service keeps it resident and starts at boot, with a **health-check background loop** for auto-recovery.
 
 This "user-space plug/unplug monitor → control amplifier/volume" pattern applies to any Linux device with abnormal speaker/headphone switching that you want to fix with a soft approach.
 
