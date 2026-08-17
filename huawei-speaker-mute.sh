@@ -41,6 +41,14 @@ AMP_SETTLE_DELAY=${AMP_SETTLE_DELAY:-1.5}
 DEBOUNCE_WINDOW=${DEBOUNCE_WINDOW:-60}       # 统计窗口（秒）
 DEBOUNCE_MAX_EVENTS=${DEBOUNCE_MAX_EVENTS:-3}  # 窗口内最大允许变化次数
 DEBOUNCE_SUSPEND_SECONDS=${DEBOUNCE_SUSPEND_SECONDS:-30}  # 触发后暂停秒数
+# PipeWire 音频路由：WirePlumber 在 BoF-XX 上 auto-profile/auto-port 均为 false，
+# 拔耳机时不会自动切换到 Speaker profile，而是回退到 HDMI（因显示器已连接）。
+# 以下变量定义 profile 名称和 sink 名称，在 jack 状态变化时显式切换。
+PW_CARD=${PW_CARD:-alsa_card.pci-0000_00_1f.3-platform-sof-essx8336}
+PW_PROFILE_HP=${PW_PROFILE_HP:-HiFi (HDMI1, HDMI2, HDMI3, Headphones, Headset, Mic)}
+PW_PROFILE_SPK=${PW_PROFILE_SPK:-HiFi (HDMI1, HDMI2, HDMI3, Headset, Mic, Speaker)}
+PW_SINK_HP=${PW_SINK_HP:-alsa_output.pci-0000_00_1f.3-platform-sof-essx8336.HiFi__Headphones__sink}
+PW_SINK_SPK=${PW_SINK_SPK:-alsa_output.pci-0000_00_1f.3-platform-sof-essx8336.HiFi__Speaker__sink}
 # ------------------------------------------------
 
 # ---------- DMI 机型识别：决定是否需要用户态操控 GPIO ----------
@@ -406,6 +414,32 @@ unplug_volume_guard() {
     done
 }
 
+# 显式切换 PipeWire profile + default sink，防止拔耳机后音频路由到 HDMI。
+# WirePlumber 在 BoF-XX 上 auto-profile/auto-port 均为 false，
+# 拔耳机时不会自动切换到 Speaker profile，而是回退到 HDMI（因显示器已连接）。
+set_audio_route() {
+    local jack_state=$1
+    [ -n "$PW_USER" ] || detect_pw
+    [ -n "$PW_USER" ] || return 0
+
+    local profile sink
+    if [ "$jack_state" = "on" ]; then
+        profile="$PW_PROFILE_HP"
+        sink="$PW_SINK_HP"
+    else
+        profile="$PW_PROFILE_SPK"
+        sink="$PW_SINK_SPK"
+    fi
+
+    # 切换 profile（切换后 sink 节点需要短暂时间注册）
+    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" \
+        pactl set-card-profile "$PW_CARD" "$profile" 2>/dev/null
+    sleep 0.3
+    # 设置 default sink
+    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" \
+        pactl set-default-sink "$sink" 2>/dev/null
+}
+
 # 启动 gpioset 保持功放供电 GPIO 为高（仅限 NEEDS_GPIO=1 的机型）。
 # BoF-XX (NEEDS_GPIO=0)：此函数为 NO-OP（BIOS 已拉好 GPIO，用户态不要重写电平）。
 start_gpioset() {
@@ -724,6 +758,8 @@ apply() {
     # 再操作功放 I2C / PipeWire 音量，避免时序竞争导致 codec IRQ 卡死。
     if [ "$transition" = "1" ] && [ -n "$PREV" ]; then
         sleep "$AMP_SETTLE_DELAY"
+        # 显式切换 PipeWire profile + default sink，防止拔耳机后路由到 HDMI
+        set_audio_route "$jack"
     fi
 
     # 耳机插入 -> 功放关闭；否则功放开启
@@ -887,6 +923,9 @@ _init_amp_state() {
     fi
 }
 _init_amp_state || apply
+
+# 启动时修正音频路由：确保 default sink 与当前 jack 状态匹配，防止开机后路由到 HDMI
+set_audio_route "$(read_jack)"
 
 # ---- 启动健康检查后台循环 ----
 # 注意：子 shell 中的 health_check 直接从 ALSA 读取 jack 状态，
