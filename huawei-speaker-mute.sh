@@ -364,19 +364,27 @@ set_speaker_vol() {
 
 # PipeWire 音量控制，以桌面用户身份执行（root 无法直接访问用户的 PipeWire 会话）。
 # 若 PipeWire 未运行则静默跳过。
+# 把"多次 set-volume 0 以应对 WirePlumber 音量恢复竞态"放进同一个 runuser 会话内完成，
+# 避免每次 unplug 触发多次 PAM 会话（日志中可见 session opened/closed 刷屏）。
 set_pw_vol() {
     [ -n "$PW_USER" ] || return 0
-    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" \
-        wpctl set-volume @DEFAULT_SINK@ "$1" >/dev/null 2>&1
+    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" PW_VOL_TARGET="$1" bash -c '
+        for i in 1 2 3; do
+            wpctl set-volume @DEFAULT_SINK@ "$PW_VOL_TARGET" >/dev/null 2>&1
+            sleep 0.25
+        done
+    '
 }
 
 # 在"真正拔掉耳机"的那一刻，先把扬声器音量在 PipeWire 层设为 0（即静音）。
 # 重复几次以应对 WirePlumber 在 jack 事件后可能触发的"按端口恢复音量"竞态。
 # 注意：这里只在拔耳机跳变瞬间执行一次，之后用户可手动调大音量（不会被反复压制）。
 unplug_volume_guard() {
+    # PipeWire 层清零（单次 runuser 会话内完成 3 次 set-volume，避免 PAM 抖动）
+    set_pw_vol 0
+    # ALSA 层同样清零（root 直接调 amixer，无 PAM 开销），兜底确保不出声。
     local i
     for i in 1 2 3; do
-        set_pw_vol 0
         set_speaker_vol 0
         sleep 0.25
     done
