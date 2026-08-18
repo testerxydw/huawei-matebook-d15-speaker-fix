@@ -1,976 +1,187 @@
 #!/bin/bash
-# 华为 MateBook 扬声器功放（HWSP0001）插拔耳机自动静音/切换修复脚本
+# 华为 MateBook HWSP0001 功放最小化控制脚本
 #
-# HWSP0001 功放没有 Linux 驱动。部分机型（如 BOD-WXX9）BIOS 会在开机时通过
-# SMM 初始化一次功放；但另一些机型（如 BoF-XX）会把功放留在默认的"静音"状态。
-# Linux 既无法在插入耳机时把功放静音，也无法在 GPIO 断电后重新初始化它。
-# 本脚本监听 ALSA 的"Headphone Jack"控件，切换功放使能 GPIO，并在功放重新
-# 上电时通过 I2C 回放功放的"使能"寄存器值。
+# 功能（仅2项）：
+#   1) 插耳机 → 写功放 0x58/0x5B 寄存器 0x01 = 0x00 → 扬声器不出声
+#   2) 拔耳机 → 写功放 0x58/0x5B 寄存器 0x01 = 0x69 → 扬声器出声
 #
-# 关键参数均在运行时自动探测：
-#   * I2C 总线       ：来自 /sys/bus/i2c/devices/i2c-HWSP0001:00
-#   * Jack 控件 numid：来自 ALSA 的 "Headphone Jack" 控件
-#   * GPIO 线号      ：由 DSDT 中 HWSP 的 _INI 的 GNUM() 参数解析得到
-#                      （通过 iasl 反汇编），失败时回退到下面的 GPIO_LINE
-#   * 扬声器音量控件 ：来自 "DAC / Speaker / Master Playback Volume"
+# 关于"扬声器+耳机同时出声"：不会发生。插耳机时功放被静音(0x00)，
+# 扬声器物理无输出；耳机声音由 codec HP 通道独立驱动，与功放无关。
 #
-# 安全特性：当"拔掉耳机"时（jack on -> off），扬声器音量会被强制设为 0
-# （通过 PipeWire，因为它在本机上拥有音量控制权），这样重新上电的功放就不会
-# 以之前耳机的音量突然炸响。用户随后可手动调大音量。插入耳机 / 开机时音量
-# 保持不变。
+# AMP_SETTLE_DELAY：jack 变化后延迟再写 I2C，避开内核 DAPM 操作
+# HP 电源域的竞争窗口，防止 codec jack-detect 锁死。
 
-# ---------- 可配置项（可用环境变量覆盖） ----------
-GPIOCHIP=${GPIOCHIP:-gpiochip0}
-GPIO_LINE=${GPIO_LINE:-}          # 留空 -> 通过 DSDT(iasl) 自动探测，否则用 145
-JACK_NUMID=${JACK_NUMID:-}        # 留空 -> 从 "Headphone Jack" 自动探测
-I2C_BUS=${I2C_BUS:-}              # 留空 -> 从 i2c-HWSP0001:00 自动探测
-SPK_VOL_NUMID=${SPK_VOL_NUMID:-}  # 留空 -> 自动探测扬声器音量控件
-SPK_VOL_DEFAULT=${SPK_VOL_DEFAULT:-70}   # 仅供说明；音量不会被强制设置（仅在拔耳机时清零）
-HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL:-60}  # 健康检查间隔（秒），默认60秒
-POLL_INTERVAL=${POLL_INTERVAL:-5}  # 轮询兜底间隔（秒），默认5秒；同时也是 input event 监听的再校准周期
-# jack 状态变化后，延迟多少秒再操作功放 I2C / PipeWire 音量。
-# 实证发现：拔/插耳机瞬间内核 DAPM 正在操作 ES8336 codec 的 HP 电源域寄存器
-# （0x15/0x17/0x18 翻转），此时脚本同时写功放 I2C + runuser wpctl 可能与内核
-# SOF IPC 的 codec 寄存器访问产生时序竞争，长期累积导致 codec jack-detect IRQ
-# 线程卡死（jack 检测运行期死亡）。此延迟让内核 DAPM 先完成电源域切换。
 AMP_SETTLE_DELAY=${AMP_SETTLE_DELAY:-1.5}
-# 防死亡 debounce：1分钟内拔插次数超过此阈值时，暂停响应 DEBOUNCE_SUSPEND_SECONDS 秒。
-# 实证发现：1分钟内频繁拔插 ≥6次会导致 ES8336 codec jack-detect IRQ 硬件锁死
-# （GPIO 81 物理线路冻结，codec 软重置也无法恢复）。debounce 通过主动减少脚本
-# 响应来降低与内核 DAPM/codec 驱动的时序竞争，防止硬件锁死。
-DEBOUNCE_WINDOW=${DEBOUNCE_WINDOW:-60}       # 统计窗口（秒）
-DEBOUNCE_MAX_EVENTS=${DEBOUNCE_MAX_EVENTS:-3}  # 窗口内最大允许变化次数
-DEBOUNCE_SUSPEND_SECONDS=${DEBOUNCE_SUSPEND_SECONDS:-30}  # 触发后暂停秒数
-# PipeWire 音频路由：WirePlumber 在 BoF-XX 上 auto-profile/auto-port 均为 false，
-# 拔耳机时不会自动切换到 Speaker profile，而是回退到 HDMI（因显示器已连接）。
-# 以下变量定义 profile 名称和 sink 名称，在 jack 状态变化时显式切换。
-PW_CARD=${PW_CARD:-alsa_card.pci-0000_00_1f.3-platform-sof-essx8336}
-PW_PROFILE_HP=${PW_PROFILE_HP:-HiFi (HDMI1, HDMI2, HDMI3, Headphones, Headset, Mic)}
-PW_PROFILE_SPK=${PW_PROFILE_SPK:-HiFi (HDMI1, HDMI2, HDMI3, Headset, Mic, Speaker)}
-PW_SINK_HP=${PW_SINK_HP:-alsa_output.pci-0000_00_1f.3-platform-sof-essx8336.HiFi__Headphones__sink}
-PW_SINK_SPK=${PW_SINK_SPK:-alsa_output.pci-0000_00_1f.3-platform-sof-essx8336.HiFi__Speaker__sink}
-# ------------------------------------------------
 
-# ---------- DMI 机型识别：决定是否需要用户态操控 GPIO ----------
-# 两种机型行为差异（关键发现！）：
-#   - BOD-WXX9 / 类似老机型：BIOS 开机时不初始化 HWSP0001 功放的 GPIO 供电脚，
-#     必须由用户态通过 gpioset 持续拉对应线为高，功放 I2C 才可访问。
-#   - BoF-XX (MateBook D 15 BoF-XX-PCB) 等新机型：BIOS 启动时已经正确设置
-#     功放 GPIO 使能脚并完成供电，用户态若再次用 gpioset 拉该线反而会破坏
-#     BIOS 建立的引脚状态，导致功放 I2C 永久无法访问（必须重启机器再次 BIOS
-#     初始化才能恢复）。
-# 因此：用 DMI "product_name"（/sys/class/dmi/id/product_name）判断。
-detect_dmi_gpio_needed() {
-    local product="" product_fallback=""
-    [ -r /sys/class/dmi/id/product_name ] && product=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
-    [ -r /sys/class/dmi/id/board_name ] && product_fallback=$(cat /sys/class/dmi/id/board_name 2>/dev/null)
-    case "${product:-$product_fallback}" in
-        BoF*)
-            # BoF-XX / BoF-XX-PCB 等：BIOS 已处理 GPIO，用户态不要碰
-            echo "0:$product:$product_fallback"
-            return 0
-            ;;
-        BOD*|BOH*)
-            # BOD-WXX9 / BOHB-WAX9-PCB-B2 等：需要用户态 gpioset
-            echo "1:$product:$product_fallback"
-            return 0
-            ;;
-    esac
-    # 未知机型：默认需要 GPIO（保守，不破坏更重要的 BOD 系列）
-    # 可通过 NEEDS_GPIO 环境变量覆盖
-    echo "1:$product:$product_fallback"
-    return 0
-}
-
-# ---- 参数自动探测辅助函数 ----
-
-detect_i2c() {
-    local link
-    link=$(readlink -f /sys/bus/i2c/devices/i2c-HWSP0001:00 2>/dev/null)
-    [ -n "$link" ] && printf '%s' "$link" | grep -oE 'i2c-[0-9]+' | head -1 | cut -d- -f2
-}
-
-detect_jack() {
-    amixer -c 0 controls 2>/dev/null \
-        | sed -n 's/.*numid=\([0-9]*\).*name=.Headphone Jack.*/\1/p' | head -1
-}
-
-detect_spk_vol() {
-    local c
-    c=$(amixer -c 0 controls 2>/dev/null \
-        | sed -n 's/.*numid=\([0-9]*\).*name=.Speaker Playback Volume.*/\1/p' | head -1)
-    [ -n "$c" ] && { echo "$c"; return; }
-    c=$(amixer -c 0 controls 2>/dev/null \
-        | sed -n 's/.*numid=\([0-9]*\).*name=.DAC Playback Volume.*/\1/p' | head -1)
-    [ -n "$c" ] && { echo "$c"; return; }
-    amixer -c 0 controls 2>/dev/null \
-        | sed -n 's/.*numid=\([0-9]*\).*name=.Master Playback Volume.*/\1/p' | head -1
-}
-
-# 从 DSDT 解析 HWSP 功放使能 GPIO 线号。
-# HWSP _INI 的做法为：PIN1 = GNUM(0x09xx00xx)。GNUM(arg) = GINF(group,6) + (arg & 0xFFFF)
-# 其中 GINF(group,6) 即 GPCL[group][6]。结果为 \_SB.GPI0 控制器相对的线号，
-# 也就是要传给 gpioset 的值。
-detect_gpio() {
-    local dsdt=/sys/firmware/acpi/tables/DSDT
-    [ -r "$dsdt" ] || return 1
-    command -v iasl >/dev/null 2>&1 || return 1
-    local tmp
-    tmp=$(mktemp -d) || return 1
-    iasl -d -p "$tmp/dsdt" "$dsdt" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
-    python3 - "$tmp/dsdt.dsl" <<'PY' 2>/dev/null
-import re
-import sys
-t=open(sys.argv[1]).read()
-i=t.find('Device (HWSP')
-seg=t[i:i+8192] if i>=0 else ''
-m=re.search(r'GNUM\s*\(\s*(0x[0-9A-Fa-f]+)\s*\)', seg)
-if not m:
-    sys.exit(1)
-arg=int(m.group(1),16)
-grp=(arg>>16)&0xff
-off=arg&0xffff
-def parse_table(t,name):
-    key='Name ('+name+','
-    i=t.find(key)
-    if i<0: return None
-    j=t.find('{',i)
-    d=0;k=j
-    while k<len(t):
-        if t[k]=='{':d+=1
-        elif t[k]=='}':
-            d-=1
-            if d==0:break
-        k+=1
-    block=t[j:k+1]
-    rows=[];p=0
-    while True:
-        mm=block.find('Package (',p)
-        if mm<0:break
-        ob=block.find('{',mm)
-        d=0;q=ob
-        while q<len(block):
-            if block[q]=='{':d+=1
-            elif block[q]=='}':
-                d-=1
-                if d==0:break
-            q+=1
-        nums=re.findall(r'0x[0-9A-Fa-f]+', block[ob+1:q])
-        rows.append([int(x,16) for x in nums])
-        p=ob+1
-    return rows
-tbl=parse_table(t,'GPCL')
-if tbl and len(tbl)>grp and len(tbl[grp])>6:
-    print(tbl[grp][6]+off)
-PY
-    local rc=$?
-    rm -rf "$tmp"
-    return $rc
-}
-
-# ---- 探测 PipeWire 用户（运行时重试，应对开机时用户会话未就绪） ----
-detect_pw() {
-    PW_USER=; PW_RUNTIME=
-    if command -v wpctl >/dev/null 2>&1; then
-        local _d
-        for _d in /run/user/*; do
-            [ -S "$_d/pipewire-0" ] && { PW_RUNTIME="$_d"; PW_USER=$(stat -c '%U' "$_d/pipewire-0"); break; }
+# 探测 I2C 总线号（功放挂载在 HWSP0001:00）
+# /sys/bus/i2c/devices/i2c-HWSP0001:00 是目录，其下有 name 文件
+# 设备节点形如 /sys/bus/i2c/devices/4-0058（总线号-地址）
+detect_i2c_bus() {
+    local f
+    # 方法1：通过 HWSP0001:00 别名找同名目录
+    if [ -d /sys/bus/i2c/devices/i2c-HWSP0001:00 ]; then
+        for f in /sys/bus/i2c/devices/*-0058; do
+            [ -d "$f" ] || continue
+            local bus=${f##*/}      # 4-0058
+            bus=${bus%%-*}           # 4
+            [ -n "$bus" ] && { echo "$bus"; return 0; }
         done
     fi
-}
-
-# ---- 探测用于耳机插拔监听的 input event 设备 ----
-# sof_es8336 驱动会创建形如 "sof-essx8336 Headset" 的 input 设备，
-# 通过 SW_HEADPHONE_INSERT / SW_MICROPHONE_INSERT 上报插拔事件。
-# 此通道比 alsactl monitor 更可靠（在 BoF-XX 等机型上 alsactl monitor 不会产生任何事件）。
-detect_input_jack_dev() {
-    local ev name d rp
-    for d in /sys/class/input/event*; do
-        [ -e "$d/device/name" ] || continue
-        name=$(cat "$d/device/name" 2>/dev/null)
-        case "$name" in
-            *Headset*)
-                ev=$(basename "$d")
-                rp=$(readlink -f "$d/device" 2>/dev/null)
-                case "$rp" in
-                    */sound/card0*) echo "/dev/input/$ev"; return 0 ;;
-                esac
-                # 若路径中没有 sound/card0 显式信息，但名称匹配也返回
-                echo "/dev/input/$ev"; return 0
-                ;;
-        esac
+    # 方法2：直接探测哪些总线能读到 0x58
+    local b
+    for b in 0 1 2 3 4 5 6 7 8 9 10 11; do
+        i2cget -y -f "$b" 0x58 0x01 >/dev/null 2>&1 && { echo "$b"; return 0; }
     done
+    echo 0
+}
+I2C_BUS=${I2C_BUS:-$(detect_i2c_bus)}
+
+# DMI 识别：BoF-XX 由 BIOS 管 GPIO，用户态不要碰
+NEEDS_GPIO=1
+_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+_board=$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)
+case "${_product:-$_board}" in
+    BoF*) NEEDS_GPIO=0 ;;
+esac
+
+# 探测 input event 耳机插孔设备
+detect_input_jack_dev() {
+    local d
+    for d in /dev/input/event*; do
+        [ -r "$d" ] || continue
+        if udevadm info --query=property --name="$d" 2>/dev/null | grep -q "EV_SW.*02\|SW_HEADPHONE_INSERT"; then
+            echo "$d"; return 0
+        fi
+    done
+    for d in /dev/input/by-path/*Headset*; do [ -r "$d" ] && { readlink -f "$d"; return 0; }; done
+    echo /dev/input/event10
+}
+JACK_INPUT_DEV=$(detect_input_jack_dev)
+
+# 核心：写功放 0x01 使能寄存器（mode 1=出声 0x69 / 0=静音 0x00）
+# 两个地址 0x58 0x5B 都写，带读回验证
+set_amp() {
+    local mode=$1
+    local expected="0x69"; [ "$mode" = "0" ] && expected="0x00"
+    local addr attempts actual ok
+    for addr in 0x58 0x5B; do
+        ok=0
+        for attempts in 1 2 3; do
+            i2cset -y -f "$I2C_BUS" "$addr" 0x01 "$expected" 2>/dev/null || true
+            actual=$(i2cget -y -f "$I2C_BUS" "$addr" 0x01 2>/dev/null)
+            [ "$actual" = "$expected" ] && { ok=1; break; }
+            sleep 0.15
+        done
+    done
+    [ "$ok" = "1" ] && return 0
+    echo "[$(date '+%F %T')] set_amp($mode): 写入失败 (期望 $expected, 0x58=$actual)" >&2
     return 1
 }
 
-# ---- 统一的耳机插拔事件监视器（Python 实现） ----
-# 优先级：1) /dev/input/eventN 的 SW 事件（主通道）
-#        2) 每 POLL_INTERVAL 秒的 amixer 轮询（兜底，防止任何事件丢失）
-# 输出格式：每行 "JACK_STATE <on|off>"，供 bash 侧消费
-# 参数：$1=input设备路径  $2=JACK_NUMID  $3=轮询间隔(秒)
-jack_monitor() {
-    local input_dev="$1" numid="$2" poll_interval="$3"
-    python3 - "$input_dev" "$numid" "$poll_interval" <<'PYEOF'
-import sys, os, struct, time, select, subprocess, re
+# GPIO 供电（仅老机型）
+[ "$NEEDS_GPIO" = "1" ] && [ -n "$GPIO_LINE" ] && {
+    gpioset -c "$GPIOCHIP" "$GPIO_LINE"=1 2>/dev/null &
+    sleep 0.5
+}
 
-input_dev, numid, poll_interval = sys.argv[1], sys.argv[2], int(sys.argv[3])
-fmt = "=qqHHi"
-fmt_size = struct.calcsize(fmt)
-EV_SW = 0x05
-SW_HP_INSERT = 0x02
-
-def read_jack():
-    try:
-        out = subprocess.check_output(
-            ["amixer", "-c", "0", "cget", "numid=%s" % numid],
-            stderr=subprocess.DEVNULL, timeout=3
-        ).decode(errors="replace")
-        m = re.search(r": values=(\w+)", out)
-        return m.group(1) if m else None
-    except Exception:
-        return None
-
-def emit(state):
-    sys.stdout.write("JACK_STATE %s\n" % state)
-    sys.stdout.flush()
-
-# 启动时先输出一次当前状态（保证启动时插着耳机的场景能立刻被上层捕获）
-last_state = None
-for _attempt in range(10):
-    cur = read_jack()
-    if cur in ("on", "off"):
-        emit(cur)
-        last_state = cur
-        break
-    time.sleep(0.3)
-
-# 打开 input 事件设备
-f = None
+# 初始状态：从 input event 设备的当前 SW_HEADPHONE_INSERT 状态读取
+# 不能依赖功放寄存器反推（BIOS 可能给半初始化值如 0x38，导致误判）
+# 读取方法：用 EVIOCGSW ioctl 获取当前 switch 状态
+read_initial_jack_state() {
+    python3 - "$JACK_INPUT_DEV" <<'PYEOF'
+import sys, os, fcntl, struct
+dev = sys.argv[1]
+EVIOCGSW = 0x8018451b  # _IOR('E', 0x1b, 32 bytes)
 try:
-    if os.access(input_dev, os.R_OK):
-        f = open(input_dev, "rb")
+    f = os.open(dev, os.O_RDONLY)
+    buf = bytearray(32)
+    fcntl.ioctl(f, EVIOCGSW, buf)
+    os.close(f)
+    # SW_HEADPHONE_INSERT = bit 2
+    if buf[0] & 0x04:
+        print("on")
+    else:
+        print("off")
 except Exception:
-    f = None
-
-if f is None:
-    # 降级为纯 amixer 轮询
-    while True:
-        time.sleep(poll_interval)
-        s = read_jack()
-        if s in ("on", "off") and s != last_state:
-            emit(s)
-            last_state = s
-    sys.exit(0)
-
-last_poll = time.time()
-while True:
-    timeout = max(0.1, poll_interval - (time.time() - last_poll))
-    try:
-        r, _, _ = select.select([f], [], [], timeout)
-    except InterruptedError:
-        r = []
-    now = time.time()
-    event_triggered = False
-    if r:
-        try:
-            d = f.read(fmt_size)
-            if len(d) < fmt_size:
-                # 设备断开：尝试重新打开
-                f.close()
-                time.sleep(1)
-                try:
-                    f = open(input_dev, "rb")
-                    continue
-                except Exception:
-                    break
-            sec, usec, t, c, v = struct.unpack(fmt, d)
-            if t == EV_SW and c == SW_HP_INSERT:
-                event_triggered = True
-        except Exception:
-            pass
-    # 无论是收到 HP 插入事件还是到了轮询周期，都读一次 ALSA 状态
-    if event_triggered or (now - last_poll >= poll_interval):
-        s = read_jack()
-        if s in ("on", "off") and s != last_state:
-            emit(s)
-            last_state = s
-        last_poll = now
+    print("off")
 PYEOF
 }
 
-# 判断功放供电 gpioset 是否正在运行（pgrep 作为唯一真相源，
-# 避免主 shell 与 health_check 子 shell 之间 CURRENT_PID 不同步造成的竞态）
-# BoF-XX 机型 BIOS 已处理 GPIO：此函数恒返回 true（GPIO 永远处于"已就绪"状态）。
-gpioset_running() {
-    if [ "${NEEDS_GPIO:-1}" = "0" ]; then
-        return 0
-    fi
-    pgrep -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" >/dev/null 2>&1
-}
-
-# 通过 I2C 回放 HWSP0001 的"使能"寄存器值，让功放恢复工作。
-# 参数 $1: 1 = 使能扬声器 (reg0x01=0x69)，0 = 软静音 (reg0x01=0x00)
-# 返回: 0=所有寄存器写后读回成功；非0=存在失败
-reinit_amp() {
-    local mode=${1:-1}
-    # 若 gpioset 是刚拉起的或当前不稳定，功放供电还在爬升，需更多时间。
-    # 这里额外 sleep 确保 I2C 总线可以访问。
-    local ADDR reg val ok=0
-    for ADDR in 0x58 0x5B; do
-        # 第一步：reg0x01 决定静音 / 使能
-        if [ "$mode" = "1" ]; then
-            i2cset -y -f "$I2C_BUS" "$ADDR" 0x01 0x69 2>/tmp/i2c_err_$$.log || true
-        else
-            i2cset -y -f "$I2C_BUS" "$ADDR" 0x01 0x00 2>/tmp/i2c_err_$$.log || true
-        fi
-        [ "$mode" != "1" ] && continue   # 静音模式：只需要写 reg0x01
-        # 其余寄存器按 amp_0x5X_init.txt 中记录的"出声状态"值回放
-        while read -r reg val; do
-            # (reg / val 已在循环中逐行赋值，属局部循环变量语义)
-            case "$reg" in
-                0x01|0x03|0x04|0x05|0x06|0x07|0x09|0x0b|0x0c|0x0d|0x0f|\
-                0x10|0x58|0x59|0x61|0x62|0x63|0x64|0x65|0x66|0x67|0x68|\
-                0x69|0x71|0x72|0x73|0x74)
-                    i2cset -y -f "$I2C_BUS" "$ADDR" "$reg" "$val" 2>/tmp/i2c_err_$$.log || true
-                    ;;
-            esac
-        done <<'REGINIT'
-0x03 0x16
-0x04 0x80
-0x05 0x0c
-0x06 0x11
-0x07 0x93
-0x09 0x0b
-0x0b 0x4b
-0x0c 0x00
-0x0d 0x77
-0x0f 0x51
-0x10 0x58
-0x58 0x00
-0x59 0x80
-0x61 0x16
-0x62 0xb5
-0x63 0x5a
-0x64 0xd5
-0x65 0x57
-0x66 0x69
-0x67 0x28
-0x68 0x35
-0x69 0x98
-0x71 0x9c
-0x72 0x33
-0x73 0x40
-0x74 0x0c
-REGINIT
-    done
-    # 读回 reg0x01 验证
-    local expected v58 v5b
-    expected="0x69"; [ "$mode" = "0" ] && expected="0x00"
-    v58=$(i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
-    v5b=$(i2cget -y -f "$I2C_BUS" 0x5B 0x01 2>/dev/null)
-    [ "$v58" = "$expected" ] && [ "$v5b" = "$expected" ] && ok=1
-    rm -f /tmp/i2c_err_$$.log
-    if [ "$ok" = "1" ]; then
-        return 0
-    else
-        echo "[$(date '+%F %T')] reinit_amp 验证失败 (期望 $expected, 实际 0x58=${v58:-<fail>} 0x5B=${v5b:-<fail>})" >&2
-        return 1
-    fi
-}
-
-set_speaker_vol() {
-    [ -n "$SPK_VOL_NUMID" ] || return 0
-    amixer -c 0 cset numid="$SPK_VOL_NUMID" "${1}%" >/dev/null 2>&1
-}
-
-# PipeWire 音量控制，以桌面用户身份执行（root 无法直接访问用户的 PipeWire 会话）。
-# 若 PipeWire 未运行则静默跳过。
-# 把"多次 set-volume 0 以应对 WirePlumber 音量恢复竞态"放进同一个 runuser 会话内完成，
-# 避免每次 unplug 触发多次 PAM 会话（日志中可见 session opened/closed 刷屏）。
-set_pw_vol() {
-    # PW_USER 可能在 health_check 子 shell 中被探测到，但子 shell 的变量
-    # 不会传回主 shell。这里做兜底：如果主 shell 的 PW_USER 为空，实时探测一次。
-    [ -n "$PW_USER" ] || detect_pw
-    [ -n "$PW_USER" ] || return 0
-    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" PW_VOL_TARGET="$1" bash -c '
-        for i in 1 2 3; do
-            wpctl set-volume @DEFAULT_SINK@ "$PW_VOL_TARGET" >/dev/null 2>&1
-            sleep 0.25
-        done
-    '
-}
-
-# 在"真正拔掉耳机"的那一刻，先把扬声器音量在 PipeWire 层设为 0（即静音）。
-# 重复几次以应对 WirePlumber 在 jack 事件后可能触发的"按端口恢复音量"竞态。
-# 注意：这里只在拔耳机跳变瞬间执行一次，之后用户可手动调大音量（不会被反复压制）。
-unplug_volume_guard() {
-    # PipeWire 层清零（单次 runuser 会话内完成 3 次 set-volume，避免 PAM 抖动）
-    set_pw_vol 0
-    # ALSA 层同样清零（root 直接调 amixer，无 PAM 开销），兜底确保不出声。
-    local i
-    for i in 1 2 3; do
-        set_speaker_vol 0
-        sleep 0.25
-    done
-}
-
-# 显式切换 PipeWire profile + default sink，防止拔耳机后音频路由到 HDMI。
-# WirePlumber 在 BoF-XX 上 auto-profile/auto-port 均为 false，
-# 拔耳机时不会自动切换到 Speaker profile，而是回退到 HDMI（因显示器已连接）。
-set_audio_route() {
-    local jack_state=$1
-    [ -n "$PW_USER" ] || detect_pw
-    [ -n "$PW_USER" ] || return 0
-
-    local profile sink
-    if [ "$jack_state" = "on" ]; then
-        profile="$PW_PROFILE_HP"
-        sink="$PW_SINK_HP"
-    else
-        profile="$PW_PROFILE_SPK"
-        sink="$PW_SINK_SPK"
-    fi
-
-    # 切换 profile（切换后 sink 节点需要短暂时间注册）
-    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" \
-        pactl set-card-profile "$PW_CARD" "$profile" 2>/dev/null
-    sleep 0.3
-    # 设置 default sink
-    runuser -u "$PW_USER" -- env XDG_RUNTIME_DIR="$PW_RUNTIME" \
-        pactl set-default-sink "$sink" 2>/dev/null
-}
-
-# 启动 gpioset 保持功放供电 GPIO 为高（仅限 NEEDS_GPIO=1 的机型）。
-# BoF-XX (NEEDS_GPIO=0)：此函数为 NO-OP（BIOS 已拉好 GPIO，用户态不要重写电平）。
-start_gpioset() {
-    if [ "${NEEDS_GPIO:-1}" = "0" ]; then
-        return 0
-    fi
-    pkill -9 -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" 2>/dev/null
-    sleep 0.3
-    local i
-    for i in 1 2 3; do
-        gpioset -c "$GPIOCHIP" "$GPIO_LINE=1" &
-        local gpid=$!
-        disown $gpid 2>/dev/null
-        sleep 0.5
-        if gpioset_running; then
-            return 0
-        fi
-        sleep 0.3
-    done
-    echo "[$(date '+%F %T')] start_gpioset 失败：3 次尝试后仍无法拉起 gpioset $GPIOCHIP $GPIO_LINE=1" >&2
-    return 1
-}
-
-set_amp() {
-    local val=$1
-    local need_gpio_start=0
-
-    # 无论静音 / 非静音，I2C 写入都需要功放供电 GPIO 为高。
-    # BoF-XX (NEEDS_GPIO=0)：gpio_running 恒 true，跳过整个启动分支。
-    if ! gpioset_running; then
-        echo "[$(date '+%F %T')] set_amp($val): gpioset 未运行，先启动功放供电..."
-        if start_gpioset; then
-            need_gpio_start=1
-        else
-            echo "[$(date '+%F %T')] set_amp($val): 无法启动功放供电 GPIO，后续 I2C 写入将失败" >&2
-        fi
-    fi
-
-    if [ "$val" = "1" ]; then
-        # 启用扬声器：确保 GPIO 供电稳定 → 回放全部寄存器 → 验证读回。
-        # 如果是刚拉起的 GPIO（仅 NEEDS_GPIO=1），功放供电需要更多建立时间（>1s）。
-        echo "[$(date '+%F %T')] set_amp(1): 恢复扬声器 (I2C 写入使能寄存器)..."
-        if [ "${NEEDS_GPIO:-1}" = "1" ] && [ "$need_gpio_start" = "1" ]; then
-            sleep 1.2
-        else
-            sleep 0.15  # BoF 机型 BIOS 已供好电，短延迟即可（无需等 LDO 稳定）
-        fi
-        local attempt delays
-        delays=(0.6 1.2 2.0)
-        for attempt in 1 2 3; do
-            if reinit_amp 1; then
-                echo "[$(date '+%F %T')] set_amp(1): 扬声器已恢复 (尝试 $attempt/3 成功)"
-                return 0
-            fi
-            echo "[$(date '+%F %T')] set_amp(1): 第 $attempt 次失败，重置 GPIO 供电后重试 (${delays[$((attempt-1))]}s)..." >&2
-            # BoF 机型：不要切 GPIO！直接重试 I2C 写入即可（GPIO 是 BIOS 的）
-            if [ "${NEEDS_GPIO:-1}" = "1" ]; then
-                pkill -9 -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" 2>/dev/null
-                sleep "${delays[$((attempt-1))]}"
-                start_gpioset || { echo "  → GPIO 重启失败，放弃" >&2; break; }
-                sleep 1.0
-            else
-                sleep "${delays[$((attempt-1))]}"
-            fi
-        done
-        echo "[$(date '+%F %T')] set_amp(1): 全部 3 次重试失败，扬声器可能仍无声" >&2
-        return 1
-    else
-        # 软静音扬声器：只写 reg0x01=0x00，保持 GPIO 供电常开。
-        # 调用 reinit_amp 0 进行写入 + 读回验证。
-        sleep 0.1
-        local j
-        for j in 1 2; do
-            if reinit_amp 0 2>/dev/null; then
-                echo "已软静音扬声器（耳机不受影响）"
-                return 0
-            fi
-            sleep 0.5
-        done
-        # 回读验证失败时，仍保证做了一次写入尝试
-        i2cset -y -f "$I2C_BUS" 0x58 0x01 0x00 2>/dev/null
-        i2cset -y -f "$I2C_BUS" 0x5B 0x01 0x00 2>/dev/null
-        echo "已软静音扬声器（耳机不受影响） [I2C 验证失败，已尽力写入]"
-        return 0
-    fi
-}
-
-read_jack() {
-    amixer -c 0 cget "numid=$JACK_NUMID" 2>/dev/null \
-        | sed -n 's/^[[:space:]]*: values=//p'
-}
-
-# ---- jack 检测通道设备级存活检查（捕获设备消失/不可读这类硬失效） ----
-# 注意：此函数只能判定"设备节点是否可读"，无法发现"设备可读但内核静默冻结"
-# （静默冻结需真实插拔才暴露，见 status 子命令提示）。
-# 返回 0=事件设备可读；非0=设备不可读。
-check_jack_detection() {
-    local dev
-    dev=$(detect_input_jack_dev)
-    [ -n "$dev" ] && [ -r "$dev" ] && return 0
-    return 1
-}
-
-# ---- 桌面/系统级告警：jack 检测死亡时通知用户（多层级兜底） ----
-# 层级：①桌面通知(notify-send，以桌面用户身份发) → ②wall 广播给所有 TTY
-#       → ③logger 写系统日志（持久可查）。
-# 自动探测桌面用户（优先复用已探测的 PW_USER，否则扫描 /run/user 下持有
-# DISPLAY 或 wayland socket 的用户），确保弹窗落到正确的图形会话。
-JACK_ALERT_RAISED=0   # 去重：已弹过告警则不再刷屏，直到恢复后重置
-notify_jack_dead() {
-    local msg="耳机插拔检测(jack)已失效：耳机插拔联动静音将不起作用，需整机重启恢复音频。"
-    local ts; ts=$(date '+%F %T')
-
-    # ① 桌面通知（critical 级，置顶+提示音）
-    local u pw_dir disp addr sent=1
-    for u in "${PW_USER:-}" ""; do
-        [ -n "$u" ] || {
-            # 自动探测：持有 DISPLAY 或 wayland socket 的用户
-            for pw_dir in /run/user/*; do
-                [ -S "$pw_dir/dbus-1" ] || [ -S "$pw_dir/bus" ] || continue
-                u=$(stat -c '%U' "$pw_dir/dbus-1" 2>/dev/null \
-                    || stat -c '%U' "$pw_dir/bus" 2>/dev/null)
-                [ -n "$u" ] && break
-            done
-        }
-        [ -n "$u" ] || continue
-        pw_dir="/run/user/$(id -u "$u" 2>/dev/null)"
-        [ -d "$pw_dir" ] || continue
-        addr="unix:path=$pw_dir/bus"
-        [ -S "$pw_dir/bus" ] || addr="unix:path=$pw_dir/dbus-1"
-        disp=":0"
-        [ -n "$DISPLAY" ] && disp="$DISPLAY"
-        if command -v runuser >/dev/null 2>&1 && command -v notify-send >/dev/null 2>&1; then
-            runuser -u "$u" -- env DISPLAY="$disp" XDG_RUNTIME_DIR="$pw_dir" \
-                DBUS_SESSION_BUS_ADDRESS="$addr" \
-                notify-send -u critical -a huawei-speaker-mute \
-                "耳机检测失效" "$msg" 2>/dev/null && sent=0
-        fi
-        [ "$sent" = "0" ] && break
-    done
-
-    # ② wall 广播给所有登录 TTY（不依赖桌面）
-    if command -v wall >/dev/null 2>&1; then
-        echo "[$ts] $msg (需整机重启恢复)" | wall 2>/dev/null || true
-    fi
-
-    # ③ 写系统日志（持久可查）
-    if command -v logger >/dev/null 2>&1; then
-        logger -t huawei-speaker-mute -p user.crit "jack 检测失效：$msg"
-    fi
-    echo "[$ts] 已发出 jack 检测失效告警（桌面通知/广播/日志）" >&2
-}
-
-# ---- 解析参数 ----
-CMD="${1:-}"
-I2C_BUS=$(detect_i2c); [ -n "$I2C_BUS" ] || { echo "错误：找不到 HWSP0001 的 I2C 总线" >&2; exit 1; }
-
-# 子命令模式（手动控制/排障）：不需要耳机插拔监听，也不依赖 ALSA Jack 控件。
-# 需要先完成 GPIO 和 PipeWire 探测。
-GPIO_LINE=$(detect_gpio)
-GPIO_LINE=${GPIO_LINE:-145}
-
-# ---- 初始化 NEEDS_GPIO 标志（DMI 探测，允许环境变量覆盖） ----
-# 输出格式："<NEEDS_GPIO>:<product_name>:<board_name>"
-_DMI_INFO=""
-_DMI_INFO=$(detect_dmi_gpio_needed)
-case ":$_DMI_INFO:" in
-    ::)
-        NEEDS_GPIO="${NEEDS_GPIO:-1}"
-        DMI_PRODUCT=""; DMI_BOARD=""
-        ;;
-    *)
-        if [ -z "${NEEDS_GPIO:-}" ]; then
-            NEEDS_GPIO="${_DMI_INFO%%:*}"
-        fi
-        _rest="${_DMI_INFO#*:}"
-        DMI_PRODUCT="${_rest%%:*}"
-        DMI_BOARD="${_rest#*:}"
-        ;;
-esac
-export NEEDS_GPIO
-detect_pw
-
-case "$CMD" in
-  mute)
-    echo "手动软静音扬声器（耳机不受影响）"
-    set_amp 0
-    exit 0
-    ;;
-  unmute)
-    echo "手动恢复扬声器"
-    set_amp 1
-    exit 0
-    ;;
-  status)
-    A=""
-    v=""
-    for A in 0x58 0x5B; do
-      v=$(i2cget -y -f "$I2C_BUS" "$A" 0x01 2>/dev/null)
-      echo "功放 $A 寄存器 0x01 = ${v:-<读取失败>}"
-    done
-    if pgrep -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" >/dev/null 2>&1; then
-        echo "GPIO 供电进程存活"
-    else
-        echo "GPIO 供电进程未启动"
-    fi
-    # jack 检测通道存活（设备级）；注意静默冻结需真实插拔才暴露
-    if check_jack_detection >/dev/null 2>&1; then
-        echo "jack 检测通道：设备可读（若插拔无反应，可能内核静默冻结，需重启恢复）"
-    else
-        echo "jack 检测通道：异常（设备不可读），耳机插拔联动可能已失效"
-    fi
-    exit 0
-    ;;
-esac
-
-# 监听模式：等待 ALSA Jack 控件就绪（开机时声卡可能未立即就绪）
-JACK_NUMID=$(detect_jack)
-if [ -z "$JACK_NUMID" ]; then
-    echo "等待 ALSA 'Headphone Jack' 控件就绪..."
-    retry=""
-    for retry in $(seq 1 15); do
-        sleep 2
-        JACK_NUMID=$(detect_jack)
-        [ -n "$JACK_NUMID" ] && break
-    done
-fi
-[ -n "$JACK_NUMID" ] || { echo "错误：找不到 'Headphone Jack' 控件" >&2; exit 1; }
-
-SPK_VOL_NUMID=$(detect_spk_vol)
-
-# 探测用于监听耳机插拔的 input 事件设备
-# （开机早期 input 设备可能未就绪，重试几次）
-JACK_INPUT_DEV=$(detect_input_jack_dev)
-if [ -z "$JACK_INPUT_DEV" ]; then
-    retry=""
-    for retry in $(seq 1 5); do
-        sleep 1
-        JACK_INPUT_DEV=$(detect_input_jack_dev)
-        [ -n "$JACK_INPUT_DEV" ] && break
-    done
-fi
-
-_GPIO_NOTE=""
-if [ "${NEEDS_GPIO:-1}" = "0" ]; then
-    _GPIO_NOTE="(DMI=[${DMI_PRODUCT:-unknown}/${DMI_BOARD:-unknown}] → BIOS 已接管功放 GPIO，用户态不操作)"
+PREV=$(read_initial_jack_state)
+if [ "$PREV" = "on" ]; then
+    CUR_AMP=0; _init_target=0
 else
-    _GPIO_NOTE="(DMI=[${DMI_PRODUCT:-unknown}/${DMI_BOARD:-unknown}] → 用户态拉功放 GPIO 供电)"
+    CUR_AMP=1; _init_target=1
 fi
-echo "使用参数：I2C_BUS=$I2C_BUS  JACK_NUMID=$JACK_NUMID  GPIO $GPIOCHIP 线号 $GPIO_LINE" \
-     " NEEDS_GPIO=${NEEDS_GPIO:-1} $_GPIO_NOTE" \
-     " SPK_VOL_NUMID=${SPK_VOL_NUMID:-none}  PipeWire 用户=${PW_USER:-none}" \
-     " 健康检查间隔=${HEALTH_CHECK_INTERVAL}s  轮询间隔=${POLL_INTERVAL}s"
-[ -n "$JACK_INPUT_DEV" ] \
-    && echo "耳机插拔监听通道：input event ($JACK_INPUT_DEV) + 轮询（主）；alsactl monitor（次）" \
-    || echo "耳机插拔监听通道：未检测到 input event 设备，使用 alsactl monitor + 轮询"
 
-# 根据耳机插孔状态应用功放状态。功放使能 GPIO 仅在"期望的功放状态真正发生变化时"
-# 才切换（而非每个事件都切换），从而避免 alsactl 的偶发事件反复拉起/杀死 gpioset。
-# 扬声器音量只在"真正拔掉耳机"的跳变时强制设为 0（静音）。
-PREV=
-CUR_AMP=
-# debounce 状态变量（防止频繁拔插导致 codec 硬件锁死）：
-# JACK_EVENT_TIMES: 环形存储最近几次 jack 变化的 epoch 秒时间戳
-# SUSPEND_UNTIL:    暂停截止 epoch 秒；<=当前时间表示未暂停
-JACK_EVENT_TIMES=()
-SUSPEND_UNTIL=0
-
-apply() {
-    local jack
-    jack=$(read_jack)
-    local transition=0
-    [ "$jack" != "$PREV" ] && transition=1
-
-    # ---- debounce 暂停检查（最高优先级，先判断是否在暂停期）----
-    local now
-    now=$(date +%s)
-    if [ "$now" -lt "$SUSPEND_UNTIL" ]; then
-        # 暂停期间跳过所有响应（不再操作功放 I2C / PipeWire / runuser）
-        # 但 PREV 必须同步更新，否则暂停结束后会把暂停期间积累的变化一次性处理
-        PREV=$jack
-        return 0
-    fi
-    # 暂停已结束：清理旧事件时间戳
-    if [ "$SUSPEND_UNTIL" -gt 0 ]; then
-        JACK_EVENT_TIMES=()
-        SUSPEND_UNTIL=0
-    fi
-
-    # ---- debounce 事件计数（仅非暂停期的变化才计数）----
-    if [ "$transition" = "1" ]; then
-        JACK_EVENT_TIMES+=("$now")
-
-        # 清理超出窗口的旧时间戳
-        local ev
-        local new_times=()
-        for ev in "${JACK_EVENT_TIMES[@]}"; do
-            if [ $((now - ev)) -le "$DEBOUNCE_WINDOW" ]; then
-                new_times+=("$ev")
-            fi
-        done
-        JACK_EVENT_TIMES=("${new_times[@]}")
-
-        # 窗口内事件数超阈值 → 触发暂停
-        local count=${#JACK_EVENT_TIMES[@]}
-        if [ "$count" -gt "$DEBOUNCE_MAX_EVENTS" ]; then
-            SUSPEND_UNTIL=$((now + DEBOUNCE_SUSPEND_SECONDS))
-            echo "[$(date '+%F %T')] 防死亡 debounce：${DEBOUNCE_WINDOW}秒内${count}次拔插，暂停响应${DEBOUNCE_SUSPEND_SECONDS}秒（至$(date -d "@$SUSPEND_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "N/A")）" >&2
-            echo "[$(date '+%F %T')] 防死亡 debounce：暂停中..." >&2
-            PREV=$jack
-            return 0
-        fi
-    fi
-
-    # jack 状态变化时，先等待内核 DAPM 完成 ES8336 HP 电源域切换，
-    # 再操作功放 I2C / PipeWire 音量，避免时序竞争导致 codec IRQ 卡死。
-    if [ "$transition" = "1" ] && [ -n "$PREV" ]; then
-        sleep "$AMP_SETTLE_DELAY"
-        # 显式切换 PipeWire profile + default sink，防止拔耳机后路由到 HDMI
-        set_audio_route "$jack"
-    fi
-
-    # 耳机插入 -> 功放关闭；否则功放开启
-    local want=1
-    [ "$jack" = "on" ] && want=0
-    if [ "$want" != "$CUR_AMP" ]; then
-        set_amp "$want"
-        CUR_AMP=$want
-    fi
-
-    # 真正拔掉耳机：先把扬声器音量设为 0（静音，通过拥有音量的 PipeWire 完成），
-    # 这样重新上电的功放绝不会以之前耳机的音量突然炸响。之后用户可手动调大音量。
-    if [ "$transition" = "1" ] && [ "$PREV" = "on" ] && [ "$jack" = "off" ]; then
-        unplug_volume_guard
-    fi
-    PREV=$jack
-}
-
-# 健康检查：防止 gpioset 意外退出或功放寄存器被意外重置
-# 每 HEALTH_CHECK_INTERVAL 秒检查一次，发现异常自动恢复。
-# 注意：此函数在子 shell 中运行，不能依赖主进程的 CUR_AMP 变量，
-# 必须直接从 ALSA 读取当前 jack 状态来判断期望的功放状态。
-health_check() {
-    # 直接从 ALSA 读取当前 jack 状态
-    local jack want expected
-    jack=$(read_jack)
-    want=1
-    [ "$jack" = "on" ] && want=0
-    [ "$want" = "1" ] && expected="0x69" || expected="0x00"
-
-    # 仅 NEEDS_GPIO=1 机型需要检查 & 重启 gpioset。
-    # BoF-XX 机型：BIOS 控制 GPIO，内核直接读状态。
-    if [ "${NEEDS_GPIO:-1}" = "1" ] && ! gpioset_running; then
-        echo "[$(date '+%F %T')] 健康检查：GPIO 供电进程丢失，正在重启..."
-        if start_gpioset; then
-            sleep 0.8
-            reinit_amp "$want" >/dev/null 2>&1 || true
-            echo "[$(date '+%F %T')] 健康检查：GPIO 供电已恢复"
-        else
-            echo "[$(date '+%F %T')] 健康检查：GPIO 供电重启失败" >&2
-        fi
-    fi
-
-    # 验证功放 0x01 寄存器是否处于合法值
-    local v58 v5b attempts
-    v58=$(i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
-    v5b=$(i2cget -y -f "$I2C_BUS" 0x5B 0x01 2>/dev/null)
-    if [ "$v58" != "$expected" ] || [ "$v5b" != "$expected" ]; then
-        echo "[$(date '+%F %T')] 健康检查：功放寄存器异常 (期望 $expected, 实际 0x58=${v58:-<fail>} 0x5B=${v5b:-<fail>})，正在恢复..."
-        # 使用统一的 reinit_amp（带重试、带读回验证），最多 2 次尝试
-        for attempts in 1 2; do
-            if reinit_amp "$want" >/dev/null 2>&1; then
-                echo "[$(date '+%F %T')] 健康检查：功放寄存器已恢复 (尝试 $attempts/2)"
-                return 0
-            fi
-            # NEEDS_GPIO=1：再重启一次 GPIO；BoF-XX 不碰 GPIO
-            if [ "${NEEDS_GPIO:-1}" = "1" ]; then
-                pkill -9 -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" 2>/dev/null
-                sleep 0.8
-                start_gpioset >/dev/null 2>&1 || break
-                sleep 1.0
-            else
-                sleep 0.8
-            fi
-        done
-        echo "[$(date '+%F %T')] 健康检查：功放寄存器恢复失败" >&2
-    fi
-
-    # jack 检测通道设备级存活检查（捕获设备消失/不可读这类硬失效）
-    # 设备不可读 => 联动彻底失效，弹系统级告警（去重：已告警则不再刷屏）。
-    # 设备恢复可读 => 重置去重标志，下次再死可重新告警。
-    # 额外：通过 IRQ 计数停滞检测"设备可读但内核静默冻结"——这是 BoF-XX 上
-    # 更常见的死亡模式（设备节点存活、但零 SW 事件）。
-    # 方法：读取 jack-detect GPIO 对应的中断计数，若连续 3 个健康检查周期
-    # (3分钟) 计数零增长，则判定 jack 检测已冻结。
-    # 注意：amixer kcontrol 值在 BoF-XX 上不可靠（snd_ctl_notify 缺失），
-    # 不能用于二次确认；仅用 IRQ 计数增长判断 jack 是否活着。
-    if check_jack_detection; then
-        local irq_now irq_stuck=0
-        irq_now=$(grep "es8316" /proc/interrupts 2>/dev/null \
-                  | head -1 \
-                  | awk '{sum=0; for(i=2;i<=NF-3;i++) sum+=$i; print sum}')
-        irq_now=${irq_now:-0}
-        # 仅当 IRQ 曾经 >0（说明 jack 检测曾工作过）后才启用停滞检测。
-        # 开机后无人拔插时 IRQ=0 是正常的，不能误判为"停滞"。
-        if [ -n "${LAST_IRQ_COUNT:-}" ] && [ "${LAST_IRQ_COUNT:-0}" -gt 0 ]; then
-            if [ "$irq_now" = "$LAST_IRQ_COUNT" ]; then
-                IRQ_STALL_COUNT=$((IRQ_STALL_COUNT + 1))
-            else
-                IRQ_STALL_COUNT=0
-            fi
-            # 连续 3 个周期（3分钟）IRQ 计数零增长才判为冻结
-            if [ "${IRQ_STALL_COUNT:-0}" -ge 3 ]; then
-                irq_stuck=1
-            fi
-        fi
-        LAST_IRQ_COUNT=$irq_now
-
-        if [ "$irq_stuck" = "1" ] && [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
-            JACK_ALERT_RAISED=1
-            echo "[$(date '+%F %T')] 健康检查：jack IRQ 计数连续 3 周期停滞 (IRQ=$irq_now)，疑似冻结" >&2
-            notify_jack_dead
-        elif [ "$irq_stuck" != "1" ]; then
-            JACK_ALERT_RAISED=0
-        fi
-    else
-        if [ "${JACK_ALERT_RAISED:-0}" != "1" ]; then
-            JACK_ALERT_RAISED=1
-            notify_jack_dead
-        fi
-    fi
-
-    # 如果 PipeWire 用户还未探测到，重试（应对开机时用户会话未就绪）
-    if [ -z "$PW_USER" ]; then
-        detect_pw
-        if [ -n "$PW_USER" ]; then
-            echo "[$(date '+%F %T')] 健康检查：PipeWire 用户已就绪 ($PW_USER)"
-        fi
-    fi
-}
+# 强制对齐功放状态：无论 BIOS 给的初始值是什么（可能是半初始化 0x38），
+# 都重写一次为期望值，避免右声道未开等问题。
+# 不加 sleep，开机时无 DAPM 竞争。
+set_amp "$_init_target" >/dev/null 2>&1
+echo "[$(date '+%F %T')] 启动：I2C_BUS=$I2C_BUS  NEEDS_GPIO=$NEEDS_GPIO  INPUT=$JACK_INPUT_DEV  jack=$PREV  功放已对齐→$_init_target" >&2
 
 cleanup() {
-    if [ "${NEEDS_GPIO:-1}" = "1" ]; then
-        pkill -9 -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" 2>/dev/null
-    fi
+    [ "$NEEDS_GPIO" = "1" ] && pkill -9 -f "gpioset -c ${GPIOCHIP}.*${GPIO_LINE}" 2>/dev/null
     exit 0
 }
-
-# 杀掉上一次运行残留、仍占用本使能线的 gpioset（仅 NEEDS_GPIO=1）
-if [ "${NEEDS_GPIO:-1}" = "1" ]; then
-    pkill -9 -f "gpioset -c $GPIOCHIP.*$GPIO_LINE" 2>/dev/null
-fi
-
 trap cleanup TERM INT
 
-# 始终先启动功放供电 GPIO（BoF-XX 机型为 NO-OP，不会破坏 BIOS 状态）
-start_gpioset
-
-# ---- 启动时功放状态检测：避免对已在工作的功放回灌寄存器引起白噪音 ----
-# BoF-XX 机型 BIOS 开机时已初始化功放（reg 0x01 = 0x69），若直接执行 set_amp(1)
-# 会在功放正在播放音频时回灌 27 个寄存器（包括静音/增益切换），产生白噪音瞬态。
-# 这里先读取功放当前状态：若已在目标状态则直接设置 CUR_AMP 跳过 reinit。
-_init_amp_state() {
-    local jack want expected
-    jack=$(read_jack)
-    want=1
-    [ "$jack" = "on" ] && want=0
-    expected="0x00"
-    [ "$want" = "1" ] && expected="0x69"
-    local val
-    val=$(sudo i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
-    val=${val:-fail}
-    if [ "$val" = "$expected" ]; then
-        # 功放已在期望状态，跳过 reinit 防止白噪音
-        CUR_AMP=$want
-        echo "[$(date '+%F %T')] 启动检测：功放已在期望状态 (0x58.01=$val, jack=$jack)，跳过 I2C 回放"
-        return 0
+# ---- 主循环：Python 监听 input event，回调 shell 写功放 ----
+# 用进程替换 < <() 避免 subshell 丢变量
+while read -r _marker state _rest; do
+    [ "$_marker" = "JACK_STATE" ] || continue
+    [ "$state" = "$PREV" ] && continue
+    sleep "$AMP_SETTLE_DELAY"
+    if [ "$state" = "on" ]; then
+        set_amp 0 && CUR_AMP=0 && echo "[$(date '+%F %T')] 插耳机：扬声器静音 (功放=0x00)" >&2
     else
-        echo "[$(date '+%F %T')] 启动检测：功放状态不匹配 (0x58.01=$val, 期望$expected)，将执行 I2C 回放"
-        return 1
+        set_amp 1 && CUR_AMP=1 && echo "[$(date '+%F %T')] 拔耳机：扬声器出声 (功放=0x69)" >&2
     fi
-}
-_init_amp_state || apply
+    PREV="$state"
+done < <(
+python3 - "$JACK_INPUT_DEV" <<'PYEOF'
+import sys, os, struct, select, time
+dev = sys.argv[1]
+fmt, ev, sw = "=qqHHi", 0x05, 0x02
+sz = struct.calcsize(fmt)
+try:
+    f = open(dev, "rb") if os.access(dev, os.R_OK) else None
+except Exception:
+    f = None
+if f is None:
+    print("ERR open %s" % dev, file=sys.stderr)
+    sys.exit(1)
+while True:
+    try:
+        r, _, _ = select.select([f], [], [], 1.0)
+    except InterruptedError:
+        r = []
+    if not r:
+        continue
+    try:
+        d = f.read(sz)
+        if len(d) < sz:
+            f.close(); time.sleep(1)
+            f = open(dev, "rb"); continue
+        _, _, t, c, v = struct.unpack(fmt, d)
+        if t == ev and c == sw:
+            s = "on" if v == 1 else "off"
+            sys.stdout.write("JACK_STATE %s\n" % s)
+            sys.stdout.flush()
+    except Exception:
+        pass
+PYEOF
+)
 
-# 启动时修正音频路由：确保 default sink 与当前 jack 状态匹配，防止开机后路由到 HDMI
-set_audio_route "$(read_jack)"
-
-# ---- 启动健康检查后台循环 ----
-# 注意：子 shell 中的 health_check 直接从 ALSA 读取 jack 状态，
-# 不依赖主进程的 CUR_AMP/CURRENT_PID 变量（子 shell 无法获取父进程的变量更新）。
-(
-    while true; do
-        sleep "$HEALTH_CHECK_INTERVAL"
-        health_check
-    done
-) &
-
-# ---------- 统一的耳机插拔监听（三级兜底，使用进程取代避免子 shell 变量作用域问题） ----------
-# 第一级：Python 监听 input event（SW_HEADPHONE_INSERT）+ 周期轮询，输出 "JACK_STATE on/off"
-# 第二级：alsactl monitor hw:0 （在某些机型可能从不产生事件，但作为兼容通道）
-# 第三级：纯轮询模式（每 2 秒），作为前两级都失效时的最后兜底
-
-# ---- 第一级：优先使用 input event + 轮询 的统一监视器 ----
-MONITOR_RUNNING=0
-if [ -n "$JACK_INPUT_DEV" ] && command -v python3 >/dev/null 2>&1; then
-    echo "[$(date '+%F %T')] 启动主监听通道：input event ($JACK_INPUT_DEV) + 每 ${POLL_INTERVAL}s 轮询"
-    MONITOR_RUNNING=1
-    # 关键：使用 < <(进程替换) 而非管道 | ，确保 while 循环在主进程内执行，
-    # PREV / CUR_AMP 变量能正确持久化，不会因 subshell 而丢失。
-    while read -r _marker _state _rest; do
-        [ "$_marker" = "JACK_STATE" ] || continue
-        apply
-    done < <(jack_monitor "$JACK_INPUT_DEV" "$JACK_NUMID" "$POLL_INTERVAL")
-    echo "[$(date '+%F %T')] 警告：主监听通道 (input event) 已退出，切换到 alsactl monitor"
-    MONITOR_RUNNING=0
-fi
-
-# ---- 第二级：alsactl monitor ----
-if [ "$MONITOR_RUNNING" = "0" ]; then
-    MONITOR_RUNNING=1
-    # 同样用进程取代管道，避免变量在 subshell 中丢失
-    while read -r _; do
-        apply
-    done < <(alsactl monitor hw:0 2>/dev/null)
-    echo "[$(date '+%F %T')] 警告：alsactl monitor 已退出，切换为纯轮询模式"
-    MONITOR_RUNNING=0
-fi
-
-# ---- 第三级（最后兜底）：每 2 秒轮询 ALSA 控件 ----
-echo "[$(date '+%F %T')] 进入最终兜底：纯轮询模式（每 2 秒）"
+# 如果主通道退出（Python 异常退出），最后兜底：5 秒轮询
+echo "[$(date '+%F %T')] 主监听退出，进入 5 秒轮询兜底" >&2
 while true; do
-    sleep 2
-    apply
+    sleep 5
+    cur=$(i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
+    [ -z "$cur" ] && continue
+    if [ "$cur" = "0x00" ] && [ "$PREV" != "on" ]; then
+        sleep "$AMP_SETTLE_DELAY"; set_amp 0; PREV="on"
+    elif [ "$cur" != "0x00" ] && [ "$PREV" != "off" ]; then
+        sleep "$AMP_SETTLE_DELAY"; set_amp 1; PREV="off"
+    fi
 done
