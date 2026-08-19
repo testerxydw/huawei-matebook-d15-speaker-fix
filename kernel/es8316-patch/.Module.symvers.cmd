@@ -1,1 +1,0 @@
-savedcmd_Module.symvers :=  /usr/src/linux-headers-6.18.38-amd64-desktop-rolling/scripts/mod/modpost -M -m -b -x -a      -o Module.symvers -n -T modules.order -i /usr/src/linux-headers-6.18.38-amd64-desktop-rolling/Module.symvers -e 
