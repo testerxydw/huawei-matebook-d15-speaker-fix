@@ -1,0 +1,1 @@
+savedcmd_es8316.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-6.18.38-amd64-desktop-rolling/scripts/module.lds -o es8316.ko es8316.o es8316.mod.o .module-common.o
