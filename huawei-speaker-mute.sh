@@ -145,7 +145,11 @@ dev = sys.argv[1]
 fmt, ev, sw = "=qqHHi", 0x05, 0x02
 sz = struct.calcsize(fmt)
 try:
-    f = open(dev, "rb") if os.access(dev, os.R_OK) else None
+    # 用 os.open + os.read（无缓冲）而非 open/f.read（带缓冲）。
+    # 带缓冲的 open 会在 select 唤醒后一次性读入多个 input_event 到
+    # Python 缓冲，但 select 只监控底层 fd，缓冲内剩余事件不被感知，
+    # 导致拔耳机事件延迟到下次插入时才被处理（扬声器无法及时出声）。
+    f = os.open(dev, os.O_RDONLY) if os.access(dev, os.R_OK) else None
 except Exception:
     f = None
 if f is None:
@@ -159,10 +163,10 @@ while True:
     if not r:
         continue
     try:
-        d = f.read(sz)
+        d = os.read(f, sz)
         if len(d) < sz:
-            f.close(); time.sleep(1)
-            f = open(dev, "rb"); continue
+            os.close(f); time.sleep(1)
+            f = os.open(dev, os.O_RDONLY); continue
         _, _, t, c, v = struct.unpack(fmt, d)
         if t == ev and c == sw:
             s = "on" if v == 1 else "off"
