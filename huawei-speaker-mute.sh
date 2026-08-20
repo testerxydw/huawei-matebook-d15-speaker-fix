@@ -45,16 +45,21 @@ case "${_product:-$_board}" in
 esac
 
 # 探测 input event 耳机插孔设备
+# 判定依据：sysfs capabilities/sw 的 bit2(SW_HEADPHONE_INSERT)=1。
+# 找不到时输出空（调用方跳过监听）——绝不硬编码 event* 编号：input 设备
+# 编号会随声卡加载/卸载漂移，硬编码会监听到错误设备或已删除设备（
+# 已删除设备的 fd 会让 select 立即返回 + read 报 ENODEV，导致 100% CPU 忙循环）。
 detect_input_jack_dev() {
-    local d
+    local d sw
     for d in /dev/input/event*; do
         [ -r "$d" ] || continue
-        if udevadm info --query=property --name="$d" 2>/dev/null | grep -q "EV_SW.*02\|SW_HEADPHONE_INSERT"; then
+        sw=$(cat "/sys/class/input/input${d##*event}/capabilities/sw" 2>/dev/null)
+        if [ -n "$sw" ] && [ $((0x$sw & 0x04)) -ne 0 ]; then
             echo "$d"; return 0
         fi
     done
     for d in /dev/input/by-path/*Headset*; do [ -r "$d" ] && { readlink -f "$d"; return 0; }; done
-    echo /dev/input/event10
+    echo ""
 }
 JACK_INPUT_DEV=$(detect_input_jack_dev)
 
@@ -109,9 +114,9 @@ PYEOF
 
 PREV=$(read_initial_jack_state)
 if [ "$PREV" = "on" ]; then
-    CUR_AMP=0; _init_target=0
+    _init_target=0
 else
-    CUR_AMP=1; _init_target=1
+    _init_target=1
 fi
 
 # 强制对齐功放状态：无论 BIOS 给的初始值是什么（可能是半初始化 0x38），
@@ -128,19 +133,24 @@ trap cleanup TERM INT
 
 # ---- 主循环：Python 监听 input event，回调 shell 写功放 ----
 # 用进程替换 < <() 避免 subshell 丢变量
+# 无 jack 设备（声卡未加载/失败）时跳过监听；监听中设备被移除时
+# Python 会退出（不空转），同样落到轮询兜底。
+if [ -z "$JACK_INPUT_DEV" ] || [ ! -e "$JACK_INPUT_DEV" ]; then
+    echo "[$(date '+%F %T')] 未找到耳机 jack input 设备（声卡可能未就绪），跳过监听" >&2
+else
 while read -r _marker state _rest; do
     [ "$_marker" = "JACK_STATE" ] || continue
     [ "$state" = "$PREV" ] && continue
     sleep "$AMP_SETTLE_DELAY"
     if [ "$state" = "on" ]; then
-        set_amp 0 && CUR_AMP=0 && echo "[$(date '+%F %T')] 插耳机：扬声器静音 (功放=0x00)" >&2
+        set_amp 0 && echo "[$(date '+%F %T')] 插耳机：扬声器静音 (功放=0x00)" >&2
     else
-        set_amp 1 && CUR_AMP=1 && echo "[$(date '+%F %T')] 拔耳机：扬声器出声 (功放=0x69)" >&2
+        set_amp 1 && echo "[$(date '+%F %T')] 拔耳机：扬声器出声 (功放=0x69)" >&2
     fi
     PREV="$state"
 done < <(
 python3 - "$JACK_INPUT_DEV" <<'PYEOF'
-import sys, os, struct, select, time
+import sys, os, struct, select
 dev = sys.argv[1]
 fmt, ev, sw = "=qqHHi", 0x05, 0x02
 sz = struct.calcsize(fmt)
@@ -157,30 +167,46 @@ if f is None:
     sys.exit(1)
 while True:
     try:
-        r, _, _ = select.select([f], [], [], 1.0)
+        # 超时 30s 仅作为空转唤醒间隔；设备被移除时 select 会立即
+        # 返回（POLLERR），不依赖超时来检测。
+        r, _, _ = select.select([f], [], [], 30.0)
     except InterruptedError:
-        r = []
+        continue
+    except Exception:
+        break  # fd 失效（设备被移除）→ 退出，交 shell 轮询兜底
     if not r:
         continue
     try:
         d = os.read(f, sz)
+        if not d:
+            break  # EOF / 设备移除
         if len(d) < sz:
-            os.close(f); time.sleep(1)
-            f = os.open(dev, os.O_RDONLY); continue
+            continue  # 短读：下轮 select 再取剩余数据
         _, _, t, c, v = struct.unpack(fmt, d)
         if t == ev and c == sw:
             s = "on" if v == 1 else "off"
             sys.stdout.write("JACK_STATE %s\n" % s)
             sys.stdout.flush()
-    except Exception:
-        pass
+    except OSError:
+        break  # ENODEV/EIO（设备已删除）→ 退出，交 shell 轮询兜底
 PYEOF
 )
+fi
 
-# 如果主通道退出（Python 异常退出），最后兜底：5 秒轮询
-echo "[$(date '+%F %T')] 主监听退出，进入 5 秒轮询兜底" >&2
+# 如果主通道退出（设备缺失或运行中被移除），最后兜底：5 秒轮询，
+# 并每 60 秒重新探测 jack 设备（声卡恢复后自动重启监听）。
+echo "[$(date '+%F %T')] 主监听结束，进入 5 秒轮询兜底" >&2
+_n=0
 while true; do
     sleep 5
+    _n=$((_n + 1))
+    if [ $((_n % 12)) -eq 0 ]; then
+        _newdev=$(detect_input_jack_dev)
+        if [ -n "$_newdev" ]; then
+            echo "[$(date '+%F %T')] 检测到 jack 设备 $_newdev，重新初始化监听" >&2
+            exec "$0"
+        fi
+    fi
     cur=$(i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null)
     [ -z "$cur" ] && continue
     if [ "$cur" = "0x00" ] && [ "$PREV" != "on" ]; then
