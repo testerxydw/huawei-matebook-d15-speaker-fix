@@ -1,2 +1,15 @@
 # 诊断脚本产生的临时日志（tools/ 下的 .py 为调试用，其运行产物日志不入库）
 *.log
+
+# --- 内核模块编译残留物（kernel/*-patch/ 目录） ---
+# 源码（.c/.h/Makefile）与存档模块（kernel/backup/*.ko.zst、kernel/patched/*.ko.zst）
+# 仍需跟踪；以下仅屏蔽编译中间产物与生成文件。
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
