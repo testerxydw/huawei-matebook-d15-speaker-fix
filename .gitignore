@@ -13,3 +13,4 @@
 Module.symvers
 modules.order
 .tmp_versions/
+kernel/sof_es8336-patch

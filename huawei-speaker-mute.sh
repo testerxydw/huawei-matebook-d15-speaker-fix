@@ -50,10 +50,13 @@ esac
 # 编号会随声卡加载/卸载漂移，硬编码会监听到错误设备或已删除设备（
 # 已删除设备的 fd 会让 select 立即返回 + read 报 ENODEV，导致 100% CPU 忙循环）。
 detect_input_jack_dev() {
-    local d sw
+    local d real sw
     for d in /dev/input/event*; do
         [ -r "$d" ] || continue
-        sw=$(cat "/sys/class/input/input${d##*event}/capabilities/sw" 2>/dev/null)
+        # eventX 与 inputY 编号可能错位（实测 event10 ↔ input23），
+        # 必须通过 symlink 解析真实 input 节点再读能力位。
+        real=$(readlink -f "/sys/class/input/$(basename "$d")" 2>/dev/null) || continue
+        sw=$(cat "${real%/event*}/capabilities/sw" 2>/dev/null)
         if [ -n "$sw" ] && [ $((0x$sw & 0x04)) -ne 0 ]; then
             echo "$d"; return 0
         fi
@@ -200,7 +203,9 @@ _n=0
 while true; do
     sleep 5
     _n=$((_n + 1))
-    if [ $((_n % 12)) -eq 0 ]; then
+    # 每 15 秒重新探测 jack 设备（声卡 probe 可能晚于服务启动，
+    # 恢复后尽快重新初始化监听）。
+    if [ $((_n % 3)) -eq 0 ]; then
         _newdev=$(detect_input_jack_dev)
         if [ -n "$_newdev" ]; then
             echo "[$(date '+%F %T')] 检测到 jack 设备 $_newdev，重新初始化监听" >&2
