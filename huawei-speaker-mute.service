@@ -6,7 +6,7 @@ Wants=pipewire.service pipewire-pulse.service sound.target
 [Service]
 Type=simple
 # 注意：/usr/local/bin 位于 OSTree 只读层，实际部署路径为 /opt（可写 overlay）
-ExecStart=/opt/huawei-speaker-mute.sh
+ExecStart=/usr/local/bin/huawei-speaker-mute.sh
 Restart=on-failure
 RestartSec=2
 # 资源限制（纵深防御）：正常 CPU≈0%（select 阻塞）、内存 <1MB；

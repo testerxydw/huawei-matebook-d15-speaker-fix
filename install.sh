@@ -77,7 +77,9 @@ echo "正在将脚本安装到 $INSTALL_BIN ..."
 install -m 0755 "$SCRIPT_SRC" "$INSTALL_BIN"
 
 echo "正在安装 systemd 服务（ExecStart=$INSTALL_BIN）..."
-sed "s#/usr/local/bin/huawei-speaker-mute.sh#$INSTALL_BIN#" "$SERVICE_SRC" \
+# 注意：服务模板 ExecStart 写死为 /opt，需用整行替换以匹配实际安装路径，
+# 不能用固定子串替换（否则 /usr/local/bin 可写时服务仍指向旧 /opt 脚本）。
+sed "s#^ExecStart=.*#ExecStart=$INSTALL_BIN#" "$SERVICE_SRC" \
     > /etc/systemd/system/huawei-speaker-mute.service
 
 echo "正在重新加载并（重启）启动服务 ..."

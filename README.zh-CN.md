@@ -133,3 +133,7 @@ i2cget -y -f <I2C_BUS> 0x58 0x01         # <I2C_BUS> 由脚本自动探测（本
 满足上述条件时，只需替换 `set_amp()` 中的 I2C 总线/地址/寄存器值、`reinit_amp()` 的初始化序列，以及（若仍依赖供电 GPIO）`detect_gpio()` 的解析逻辑，即可复用本脚本框架。
 
 **结论**：`huawei-speaker-mute.sh` 是 HWSP0001 机型的成品修复；它不是一个"开箱即用"的通用工具，但其"监听插拔 ＋ 软静音功放 ＋ 音量保护"的架构可直接作为其他同类设备的模板。
+
+## 8. 耳机麦克风路由修复（es8336 Differential Mux）
+
+插上带麦耳机却录音静音、而内置 DMIC 正常？本机 ES8336 的耳机麦信号实际在差分输入对 `lin2-rin2`（Mux=1），UCM 默认 `lin1-rin1`（Mux=0）会静音耳机麦。修复已集成进 `huawei-speaker-mute.sh`：开机与插耳机时强制把 `Differential Mux` 设为 `lin2-rin2`（并保 `Digital Mic Mux='dmic disable'`），与 `alsa-store` 形成两层持久化兜底。完整定位、能量扫描验证法与适用范围见 [HEADSET_MIC_ROUTING.zh-CN.md](doc/HEADSET_MIC_ROUTING.zh-CN.md)。

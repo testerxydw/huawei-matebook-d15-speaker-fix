@@ -1,9 +1,11 @@
 #!/bin/bash
 # 华为 MateBook HWSP0001 功放最小化控制脚本
 #
-# 功能（仅2项）：
+# 功能（3 项，均围绕耳机插孔事件联动）：
 #   1) 插耳机 → 写功放 0x58/0x5B 寄存器 0x01 = 0x00 → 扬声器不出声
 #   2) 拔耳机 → 写功放 0x58/0x5B 寄存器 0x01 = 0x69 → 扬声器出声
+#   3) 插耳机 → 设 es8316 差分路由 Differential Mux='lin2-rin2'
+#      （UCM 默认 lin1-rin1 会静音耳机麦；本机实测信号在 lin2-rin2）
 #
 # 关于"扬声器+耳机同时出声"：不会发生。插耳机时功放被静音(0x00)，
 # 扬声器物理无输出；耳机声音由 codec HP 通道独立驱动，与功放无关。
@@ -86,6 +88,39 @@ set_amp() {
     return 1
 }
 
+# ---- 耳机麦克风差分路由修复（es8316） ----
+# 根因：耳机麦信号实际在 lin2-rin2（Mux=1），UCM 默认配成 lin1-rin1（Mux=0）→ 静音。
+# 在插耳机时强制设回正确路由，并作为 UCM 在开机/插拔时覆盖（alsa-store 被 UCM 重置）的
+# 最后一道防线。控件名随编解码器而异：找不到控件时静默跳过，绝不影响功放静音核心功能。
+# 注意：Differential Mux / Digital Mic Mux 是"非 simple"控件，只能用 amixer cget/cset
+#       探测与设置，scontrols 里查不到，不能用 scontrols 做存在性判断。
+HP_MIC_DIFF_MUX=${HP_MIC_DIFF_MUX:-lin2-rin2}
+
+# 探测含目标字样的 ALSA 控件所在声卡号（默认 0）。用 cget 而非 scontrols。
+detect_alsa_card() {
+    local c
+    for c in 0 1 2 3; do
+        amixer -c "$c" cget name='Differential Mux' >/dev/null 2>&1 && { echo "$c"; return 0; }
+    done
+    echo 0
+}
+ALSA_CARD=${ALSA_CARD:-$(detect_alsa_card)}
+
+# 控件存在性探测 + 设置。控件名固定为 'Differential Mux' / 'Digital Mic Mux'
+# （es8316 上即此名，其他编解码器若无此控件则 cget 失败、静默跳过）。
+set_hp_mic_route() {
+    # 控件不存在则跳过（非 es8316 或不支持）
+    amixer -c "$ALSA_CARD" cget name='Differential Mux' >/dev/null 2>&1 || {
+        echo "[$(date '+%F %T')] 未找到 Differential Mux 控件（声卡=$ALSA_CARD），跳过耳机麦路由修复" >&2
+        return 0
+    }
+    amixer -c "$ALSA_CARD" cset name='Differential Mux' "$HP_MIC_DIFF_MUX" >/dev/null 2>&1 || true
+    # Digital Mic Mux='dmic disable' 才不静音耳机麦（其余值会静音）；无此控件则忽略
+    amixer -c "$ALSA_CARD" cget name='Digital Mic Mux' >/dev/null 2>&1 && \
+        amixer -c "$ALSA_CARD" cset name='Digital Mic Mux' 'dmic disable' >/dev/null 2>&1 || true
+    echo "[$(date '+%F %T')] 耳机麦路由：Differential Mux='$HP_MIC_DIFF_MUX' (声卡=$ALSA_CARD)" >&2
+}
+
 # GPIO 供电（仅老机型）
 [ "$NEEDS_GPIO" = "1" ] && [ -n "$GPIO_LINE" ] && {
     gpioset -c "$GPIOCHIP" "$GPIO_LINE"=1 2>/dev/null &
@@ -126,6 +161,8 @@ fi
 # 都重写一次为期望值，避免右声道未开等问题。
 # 不加 sleep，开机时无 DAPM 竞争。
 set_amp "$_init_target" >/dev/null 2>&1
+# 开机即应用耳机麦路由（覆盖 UCM 在开机阶段对 alsa-store 的重置）
+set_hp_mic_route
 echo "[$(date '+%F %T')] 启动：I2C_BUS=$I2C_BUS  NEEDS_GPIO=$NEEDS_GPIO  INPUT=$JACK_INPUT_DEV  jack=$PREV  功放已对齐→$_init_target" >&2
 
 cleanup() {
@@ -147,6 +184,8 @@ while read -r _marker state _rest; do
     sleep "$AMP_SETTLE_DELAY"
     if [ "$state" = "on" ]; then
         set_amp 0 && echo "[$(date '+%F %T')] 插耳机：扬声器静音 (功放=0x00)" >&2
+        # 插耳机时强制校正差分路由，防御 PipeWire/UCM 在插拔瞬间重置
+        set_hp_mic_route
     else
         set_amp 1 && echo "[$(date '+%F %T')] 拔耳机：扬声器出声 (功放=0x69)" >&2
     fi
