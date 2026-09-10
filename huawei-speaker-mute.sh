@@ -121,6 +121,40 @@ set_hp_mic_route() {
     echo "[$(date '+%F %T')] 耳机麦路由：Differential Mux='$HP_MIC_DIFF_MUX' (声卡=$ALSA_CARD)" >&2
 }
 
+# ---- SOF wedge 看门狗：检测 IPC 超时，仅通知用户手动重启（不自动重启） ----
+# 服务以 root 运行，notify-send 需发到登录用户的 DBUS 会话。
+# 用 /run 哨兵保证每次启动只通知一次；用户重启后若再 wedge 会再通知。
+WEDGE_NOTIFY=${WEDGE_NOTIFY:-1}
+WEDGE_NOTIFY_FLAG=/run/sof-wedge-notified
+
+notify_user() {
+    local title="$1" body="$2" uid bus user
+    for p in /run/user/*; do
+        uid=${p##*/}
+        [ "$uid" -gt 0 ] 2>/dev/null || continue
+        bus="$p/bus"; user=$(id -nu "$uid" 2>/dev/null) || continue
+        sudo -u "$user" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+            DISPLAY=:0 notify-send -u critical "$title" "$body" 2>/dev/null && break
+    done
+}
+
+wedge_watchdog() {
+    [ "$WEDGE_NOTIFY" = "1" ] || return 0
+    [ -e "$WEDGE_NOTIFY_FLAG" ] && return 0
+    if dmesg 2>/dev/null | grep -qE 'sof[-_].*(ipc.*timeout|ipc failed)|ASoC error \(-110\)'; then
+        touch "$WEDGE_NOTIFY_FLAG"
+        notify_user "音频固件卡死" \
+            "检测到 SOF IPC 超时，音频已失效。请手动重启系统以恢复声音。"
+    fi
+}
+
+wedge_watchdog_loop() {
+    while true; do
+        sleep 30
+        wedge_watchdog
+    done
+}
+
 # GPIO 供电（仅老机型）
 [ "$NEEDS_GPIO" = "1" ] && [ -n "$GPIO_LINE" ] && {
     gpioset -c "$GPIOCHIP" "$GPIO_LINE"=1 2>/dev/null &
@@ -165,7 +199,11 @@ set_amp "$_init_target" >/dev/null 2>&1
 set_hp_mic_route
 echo "[$(date '+%F %T')] 启动：I2C_BUS=$I2C_BUS  NEEDS_GPIO=$NEEDS_GPIO  INPUT=$JACK_INPUT_DEV  jack=$PREV  功放已对齐→$_init_target" >&2
 
+# 启动 wedge 看门狗（后台轮询，仅通知不重启）
+wedge_watchdog_loop & WEDGE_PID=$!
+
 cleanup() {
+    [ -n "$WEDGE_PID" ] && kill "$WEDGE_PID" 2>/dev/null
     [ "$NEEDS_GPIO" = "1" ] && pkill -9 -f "gpioset -c ${GPIOCHIP}.*${GPIO_LINE}" 2>/dev/null
     exit 0
 }

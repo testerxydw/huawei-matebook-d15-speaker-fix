@@ -65,7 +65,31 @@ install_deps() {
     fi
 }
 
+# ---------- 音频加固：开机静态配置（拓扑 + UCM） ----------
+# 拓扑参数仅模块加载时读一次，必须由安装期写一次；运行期服务无法安全更改（重载=丢设备）。
+# SKIP_TOPO=1 跳过强制无 DMIC 拓扑；SKIP_UCM=1 跳过 UCM 差分路由修正。
+apply_boot_hardening() {
+    if [ "${SKIP_TOPO:-0}" != "1" ] && \
+       [ -f /lib/firmware/intel/sof-tplg/sof-adl-es8336-ssp0.tplg.zst ]; then
+        echo 'options snd_sof tplg_filename=sof-adl-es8336-ssp0.tplg' > \
+            /etc/modprobe.d/sof-es8336-nodmic.conf
+        echo "已写入 /etc/modprobe.d/sof-es8336-nodmic.conf（强制无 DMIC 拓扑，需重启生效）"
+    fi
+
+    local UCM=/usr/share/alsa/ucm2/Intel/sof-essx8336/sof-essx8336.conf
+    if [ "${SKIP_UCM:-0}" != "1" ] && [ -f "$UCM" ] && ! grep -q "Differential Mux" "$UCM"; then
+        if [ -w "$UCM" ]; then
+            cp "$UCM" "$UCM.bak"
+            sed -i -E "s/^([[:space:]]*)cset \"name='Headphone Playback Volume' 100%\"/&\n\1cset \"name='Differential Mux' 1\"/" "$UCM"
+            echo "已修正 UCM：$UCM（BootSequence 加 Differential Mux=1）"
+        else
+            echo "警告：UCM 文件只读（$UCM），跳过 UCM 修正；耳机麦路由由 huawei-speaker-mute.sh 运行时设置兜底。" >&2
+        fi
+    fi
+}
+
 install_deps
+apply_boot_hardening
 
 if [ -w /usr/local/bin ]; then
     BIN_DIR=/usr/local/bin
