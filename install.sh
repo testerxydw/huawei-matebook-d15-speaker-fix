@@ -91,6 +91,43 @@ apply_boot_hardening() {
     fi
 }
 
+# ---------- WirePlumber：禁止 ES8336 空闲挂起（配置固化于本项目 config/wireplumber/） ----------
+# 目的：避免 ES8336(pcm0，扬声器+耳机共用) 空闲后被 WirePlumber 挂起(关 PCM)，减少偶发失声。
+# 恢复方式（详见配置文件的头注释）：删除安装位置的 51-sof-essx8336-nosuspend.conf 并重启 wireplumber。
+# SKIP_WP_NOSUSPEND=1 可跳过；DESKTOP_USER=<用户> 可指定目标桌面用户。
+detect_desktop_user() {
+    if [ -n "${DESKTOP_USER:-}" ]; then echo "$DESKTOP_USER"; return 0; fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"; return 0; fi
+    local d
+    for d in /run/user/*; do
+        [ -S "$d/bus" ] || [ -S "$d/dbus-1" ] || continue
+        { stat -c '%U' "$d/bus" 2>/dev/null || stat -c '%U' "$d/dbus-1" 2>/dev/null; } && return 0
+    done
+}
+apply_wireplumber_nosuspend() {
+    [ "${SKIP_WP_NOSUSPEND:-0}" = "1" ] && { echo "已跳过 WirePlumber 空闲挂起配置 (SKIP_WP_NOSUSPEND=1)"; return 0; }
+    local CONF_SRC="$SRC_DIR/config/wireplumber/51-sof-essx8336-nosuspend.conf"
+    [ -f "$CONF_SRC" ] || { echo "警告：未找到 $CONF_SRC，跳过 WirePlumber 配置" >&2; return 0; }
+    local u home dst_dir
+    u=$(detect_desktop_user)
+    if [ -z "$u" ]; then echo "警告：未探测到桌面用户，跳过 WirePlumber 配置（可设 DESKTOP_USER=<用户> 重试）" >&2; return 0; fi
+    home=$(getent passwd "$u" | cut -d: -f6)
+    [ -n "$home" ] || { echo "警告：无法获取用户 $u 的家目录，跳过" >&2; return 0; }
+    dst_dir="$home/.config/wireplumber/wireplumber.conf.d"
+    mkdir -p "$dst_dir"
+    install -m 0644 -o "$u" -g "$u" "$CONF_SRC" "$dst_dir/51-sof-essx8336-nosuspend.conf" 2>/dev/null \
+        || install -m 0644 "$CONF_SRC" "$dst_dir/51-sof-essx8336-nosuspend.conf"
+    echo "已固化 WirePlumber 配置：$dst_dir/51-sof-essx8336-nosuspend.conf"
+    local uid; uid=$(id -u "$u" 2>/dev/null)
+    if command -v runuser >/dev/null 2>&1 && [ -n "$uid" ]; then
+        runuser -u "$u" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user restart wireplumber 2>/dev/null \
+            && echo "已重启 WirePlumber（用户 $u）" \
+            || echo "提示：WirePlumber 重启失败，请在该用户会话内手动执行：systemctl --user restart wireplumber"
+    fi
+    echo "恢复方式：rm -f $dst_dir/51-sof-essx8336-nosuspend.conf && systemctl --user restart wireplumber"
+}
+
 install_deps
 apply_boot_hardening
 
@@ -117,5 +154,7 @@ if systemctl is-active --quiet huawei-speaker-mute.service; then
 else
     systemctl start huawei-speaker-mute.service
 fi
+
+apply_wireplumber_nosuspend
 
 echo "完成。查看状态请运行：sudo systemctl status huawei-speaker-mute.service"
