@@ -121,6 +121,55 @@ set_hp_mic_route() {
     echo "[$(date '+%F %T')] 耳机麦路由：Differential Mux='$HP_MIC_DIFF_MUX' (声卡=$ALSA_CARD)" >&2
 }
 
+# ---- 命令行子命令（手动控制；无参数时进入常驻监听） ----
+# 用途：jack 检测卡死等导致未能自动切换时的手动兜底。
+#   speaker   → 切扬声器（Headphone Switch=off, Speaker Switch=on, 功放=0x69）
+#   headphone → 切耳机（Headphone Switch=on, Speaker Switch=off, 功放=0x00）
+#   mute      → 仅功放静音（扬声器不出声）
+#   unmute    → 仅功放解静音（扬声器出声）
+#   status    → 打印 jack / 开关 / 功放寄存器状态
+codec_set_output() {
+    local spk hp
+    if [ "$1" = "speaker" ]; then spk=on; hp=off; else spk=off; hp=on; fi
+    amixer -c "$ALSA_CARD" cset name='Speaker Switch'   "$spk" >/dev/null 2>&1 || true
+    amixer -c "$ALSA_CARD" cset name='Headphone Switch' "$hp"  >/dev/null 2>&1 || true
+}
+
+print_status() {
+    local jid jack spk hp a58 a5b
+    jid=$(amixer -c "$ALSA_CARD" controls 2>/dev/null | sed -n "s/^numid=\([0-9]*\),.*name='Headphone Jack'.*/\1/p" | head -1)
+    jack=$( [ -n "$jid" ] && amixer -c "$ALSA_CARD" cget numid="$jid" 2>/dev/null | sed -n 's/.*values=//p' | tail -1 )
+    spk=$(amixer -c "$ALSA_CARD" cget name='Speaker Switch'  2>/dev/null | sed -n 's/.*values=//p' | tail -1)
+    hp=$(amixer -c "$ALSA_CARD" cget name='Headphone Switch' 2>/dev/null | sed -n 's/.*values=//p' | tail -1)
+    a58=$(i2cget -y -f "$I2C_BUS" 0x58 0x01 2>/dev/null || echo 'n/a')
+    a5b=$(i2cget -y -f "$I2C_BUS" 0x5B 0x01 2>/dev/null || echo 'n/a')
+    printf 'Jack(Headphone)  : %s\n' "${jack:-?}"
+    printf 'Speaker Switch   : %s\n' "${spk:-?}"
+    printf 'Headphone Switch : %s\n' "${hp:-?}"
+    printf 'Amp 0x58 reg0x01 : %s   (0x00=静音/扬声器不响, 0x69=出声)\n' "$a58"
+    printf 'Amp 0x5B reg0x01 : %s\n' "$a5b"
+    printf 'I2C_BUS=%s  ALSA_CARD=%s\n' "$I2C_BUS" "$ALSA_CARD"
+}
+
+case "${1:-}" in
+    speaker)
+        codec_set_output speaker; set_amp 1
+        echo "已切换到扬声器（Headphone Switch=off, Speaker Switch=on, 功放=0x69）"; exit 0 ;;
+    headphone)
+        codec_set_output headphone; set_amp 0; set_hp_mic_route
+        echo "已切换到耳机（Headphone Switch=on, Speaker Switch=off, 功放=0x00 扬声器静音）"; exit 0 ;;
+    mute)
+        set_amp 0; echo "功放已静音（扬声器不出声）"; exit 0 ;;
+    unmute)
+        set_amp 1; echo "功放已解除静音（扬声器出声）"; exit 0 ;;
+    status)
+        print_status; exit 0 ;;
+    "")
+        : ;;   # 无参数：进入常驻监听
+    *)
+        echo "用法: $0 [speaker|headphone|status|mute|unmute]" >&2; exit 2 ;;
+esac
+
 # ---- SOF wedge 看门狗：检测 IPC 超时，仅通知用户手动重启（不自动重启） ----
 # 服务以 root 运行，notify-send 需发到登录用户的 DBUS 会话。
 # 用 /run 哨兵保证每次启动只通知一次；用户重启后若再 wedge 会再通知。

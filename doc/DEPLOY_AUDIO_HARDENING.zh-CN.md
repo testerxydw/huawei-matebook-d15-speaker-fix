@@ -46,6 +46,13 @@ sudo mv "$UCM.bak" "$UCM"        # 恢复原 UCM
 
 ## 改动二：强制无 DMIC 拓扑（防 wedge，需重启）
 
+> 🚫 **2026-09-10 实测失败，已默认关闭（需 FORCE_NODMIC_TOPO=1 才应用）**：
+> 强制无 DMIC 拓扑在本机**会破坏 UCM、导致开机"没有音频设备"**。机制：卡片 `alsa.components`
+> 仍含 `cfg-dmics:2`（来自 NHLT，不受拓扑影响），UCM 的 HiFi verb 因此仍引用 `hw:0,1`；
+> 而无 DMIC 拓扑已无 `hw:0,1` → HiFi verb 建立失败 → `pactl` 只剩 `off`/`pro-audio` 两个 profile，
+> WirePlumber 建不出真实 sink，只剩 `null-sink`。ALSA 层 `aplay -D hw:0,0` 其实正常，纯粹是 profile 丢失。
+> 结论：UDMIC 拓扑与仍广播 DMIC 的 NHLT/UCM **不兼容**，此路不通；架构上要"无 DMIC"必须同时改 NHLT 或 UCM，均不可行（/usr 只读且 NHLT 来自 BIOS）。故本项回退，防 wedge 改为依赖"仅通知看门狗"。
+>
 > ⚠️ **Tradeoff**：内置 DMIC 麦克风将不可用（视频会议等需外置/耳麦麦）。
 > ⚠️ 仅堵"DMIC 触发"这一已知 wedge 源；固件 IPC / ABI 不匹配(3:22:1 vs 3:23:1)根因未动，不保证 100% 不再出现其他触发。
 > ⚠️ 对 `linux-firmware` 升级脆弱：若某次升级删掉该 `.tplg`，开机加载拓扑失败 → 整段音频丢失。建议把文件复制到稳定位置（见"加固"小节）。

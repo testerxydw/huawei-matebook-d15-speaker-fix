@@ -61,9 +61,11 @@ Common env vars (override auto-detection): `GPIOCHIP`, `GPIO_LINE`, `JACK_NUMID`
 
 Manual control (independent of auto-monitoring) is also supported:
 ```bash
-huawei-speaker-mute.sh mute     # soft-mute speaker (same as headphone inserted)
-huawei-speaker-mute.sh unmute   # restore speaker
-huawei-speaker-mute.sh status   # show amplifier 0x01 register state
+sudo huawei-speaker-mute.sh speaker    # route to speaker (Speaker on, Headphone off, amp=0x69)
+sudo huawei-speaker-mute.sh headphone  # route to headphone (Headphone on, Speaker off, amp=0x00)
+sudo huawei-speaker-mute.sh mute       # soft-mute speaker only (amp=0x00)
+sudo huawei-speaker-mute.sh unmute     # restore speaker (amp=0x69)
+sudo huawei-speaker-mute.sh status     # show jack / switches / amplifier 0x01 state
 ```
 
 ## 4. Verification Criteria

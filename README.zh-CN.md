@@ -61,9 +61,11 @@
 
 如需手动控制（不依赖自动监听），脚本也支持子命令：
 ```bash
-huawei-speaker-mute.sh mute     # 软静音扬声器（等价插入耳机效果）
-huawei-speaker-mute.sh unmute   # 恢复扬声器
-huawei-speaker-mute.sh status   # 查看功放 0x01 寄存器状态
+sudo huawei-speaker-mute.sh speaker    # 切到扬声器（Speaker on / Headphone off / 功放=0x69）
+sudo huawei-speaker-mute.sh headphone  # 切到耳机（Headphone on / Speaker off / 功放=0x00）
+sudo huawei-speaker-mute.sh mute       # 仅软静音扬声器（功放=0x00）
+sudo huawei-speaker-mute.sh unmute     # 恢复扬声器（功放=0x69）
+sudo huawei-speaker-mute.sh status     # 查看 jack / 开关 / 功放 0x01 寄存器状态
 ```
 
 ## 4. 验证标准（检验修复是否成功）

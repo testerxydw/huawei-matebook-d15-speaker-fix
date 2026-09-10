@@ -67,13 +67,16 @@ install_deps() {
 
 # ---------- 音频加固：开机静态配置（拓扑 + UCM） ----------
 # 拓扑参数仅模块加载时读一次，必须由安装期写一次；运行期服务无法安全更改（重载=丢设备）。
-# SKIP_TOPO=1 跳过强制无 DMIC 拓扑；SKIP_UCM=1 跳过 UCM 差分路由修正。
+# ⚠️ 实测（2026-09-10）：强制无 DMIC 拓扑在本机会破坏 UCM——NHLT 仍广播 cfg-dmics:2，
+#    UCM 的 HiFi verb 会引用不存在的 hw:0,1，导致 HiFi profile 丢失、PipeWire 只剩 null-sink
+#    （表现为"没有音频设备"）。因此该改动**默认关闭**，仅在显式 FORCE_NODMIC_TOPO=1 时才应用。
+# SKIP_UCM=1 跳过 UCM 差分路由修正。
 apply_boot_hardening() {
-    if [ "${SKIP_TOPO:-0}" != "1" ] && \
+    if [ "${FORCE_NODMIC_TOPO:-0}" = "1" ] && \
        [ -f /lib/firmware/intel/sof-tplg/sof-adl-es8336-ssp0.tplg.zst ]; then
         echo 'options snd_sof tplg_filename=sof-adl-es8336-ssp0.tplg' > \
             /etc/modprobe.d/sof-es8336-nodmic.conf
-        echo "已写入 /etc/modprobe.d/sof-es8336-nodmic.conf（强制无 DMIC 拓扑，需重启生效）"
+        echo "已写入 /etc/modprobe.d/sof-es8336-nodmic.conf（强制无 DMIC 拓扑，需重启生效；注意可能破坏 UCM）"
     fi
 
     local UCM=/usr/share/alsa/ucm2/Intel/sof-essx8336/sof-essx8336.conf
